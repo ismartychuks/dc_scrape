@@ -141,36 +141,11 @@ def log(message):
     socketio.emit('log', {'message': message})
 
 def send_alert_email(subject, body):
-    """Send alert email for critical issues"""
-    if not EMAIL_USER or not EMAIL_PASSWORD:
-        return False
-    
-    try:
-        # Get render URL if available
-        render_url = os.getenv("RENDER_SERVICE_URL", "https://your-render-url.onrender.com")
-        restart_link = f"{render_url}/api/start"
-        
-        msg = EmailMessage()
-        msg['Subject'] = f"[Discord Archiver Alert] {subject}"
-        msg['From'] = EMAIL_USER
-        msg['To'] = EMAIL_USER
-        msg.set_content(f"{body}\n\n--- RESTART INSTRUCTIONS ---\n\n" + 
-                       f"Option 1 (Click link): {restart_link}\n\n" +
-                       f"Option 2 (Render Dashboard):\n" +
-                       f"1. Go to https://dashboard.render.com\n" +
-                       f"2. Click 'discord-archiver' service\n" +
-                       f"3. Click 'Manual Deploy' > 'Deploy latest commit'\n\n" +
-                       f"Check logs at: {render_url}/ (if you have web UI access)")
-        
-        with smtplib.SMTP_SSL(EMAIL_HOST, 465) as smtp:
-            smtp.login(EMAIL_USER, EMAIL_PASSWORD)
-            smtp.send_message(msg)
-        
-        log(f"📧 Alert email sent: {subject}")
-        return True
-    except Exception as e:
-        log(f"❌ Failed to send alert email: {e}")
-        return False
+    """Send alert email for critical issues - DISABLED due to SMTP timeout on Render"""
+    # Email sending is disabled on Render free tier due to SMTP port restrictions
+    # Monitor via logs and Telegram instead
+    log(f"📧 Alert: {subject} (Email disabled - check logs)")
+    return True
 
 def set_status(status):
     archiver_state["status"] = status
@@ -185,6 +160,20 @@ def clean_text(text):
 def run_archiver_logic_async():
     """Sync Playwright code wrapped for thread pool execution"""
     log("🚀 Thread started.")
+    
+    # CRITICAL FIX: Detach from any active event loop
+    import asyncio
+    try:
+        # Try to get current event loop and close it
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Create new loop for this thread
+            asyncio.set_event_loop(None)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    except RuntimeError:
+        # No event loop in this thread (which is what we want)
+        pass
     
     # Paths
     state_path = os.path.join(DATA_DIR, STORAGE_STATE_FILE)
