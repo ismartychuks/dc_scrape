@@ -34,7 +34,7 @@ STORAGE_STATE_FILE = "storage_state.json"
 LAST_MESSAGE_ID_FILE = "last_message_ids.json"
 DATA_DIR = "data"
 
-HEADLESS_MODE = os.getenv("HEADLESS", "False").lower() == "true"
+HEADLESS_MODE = os.getenv("HEADLESS", "True").lower() == "true"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # --- Alert Configuration ---
