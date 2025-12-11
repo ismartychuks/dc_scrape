@@ -21,5 +21,7 @@ services:
         sync: false
       - key: TELEGRAM_ADMIN_ID
         sync: false
+      - key: RENDER_SERVICE_URL
+        sync: false
       - key: HEADLESS
         value: "true"

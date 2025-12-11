@@ -17,6 +17,9 @@ import smtplib
 from email.message import EmailMessage
 import telegram_bot
 
+# --- Prevent event loop conflicts ---
+os.environ['EVENTLET_NOKQUEUE'] = '1'
+
 # --- Configuration ---
 CHANNELS = os.getenv("CHANNELS", "").split(",")
 # Clean up channels (remove empty strings/whitespace)
@@ -41,6 +44,7 @@ app = Flask(__name__)
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR) 
 
+# Use threading mode to avoid async loop conflicts with sync Playwright
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # --- Global State ---
@@ -135,6 +139,38 @@ def log(message):
     if len(archiver_state["logs"]) > 50: archiver_state["logs"].pop(0)
     socketio.emit('log', {'message': message})
 
+def send_alert_email(subject, body):
+    """Send alert email for critical issues"""
+    if not EMAIL_USER or not EMAIL_PASSWORD:
+        return False
+    
+    try:
+        # Get render URL if available
+        render_url = os.getenv("RENDER_SERVICE_URL", "https://your-render-url.onrender.com")
+        restart_link = f"{render_url}/api/start"
+        
+        msg = EmailMessage()
+        msg['Subject'] = f"[Discord Archiver Alert] {subject}"
+        msg['From'] = EMAIL_USER
+        msg['To'] = EMAIL_USER
+        msg.set_content(f"{body}\n\n--- RESTART INSTRUCTIONS ---\n\n" + 
+                       f"Option 1 (Click link): {restart_link}\n\n" +
+                       f"Option 2 (Render Dashboard):\n" +
+                       f"1. Go to https://dashboard.render.com\n" +
+                       f"2. Click 'discord-archiver' service\n" +
+                       f"3. Click 'Manual Deploy' > 'Deploy latest commit'\n\n" +
+                       f"Check logs at: {render_url}/ (if you have web UI access)")
+        
+        with smtplib.SMTP_SSL(EMAIL_HOST, 465) as smtp:
+            smtp.login(EMAIL_USER, EMAIL_PASSWORD)
+            smtp.send_message(msg)
+        
+        log(f"📧 Alert email sent: {subject}")
+        return True
+    except Exception as e:
+        log(f"❌ Failed to send alert email: {e}")
+        return False
+
 def set_status(status):
     archiver_state["status"] = status
     socketio.emit('status_update', {'status': status})
@@ -147,6 +183,9 @@ def clean_text(text):
 # --- Scraper Logic ---
 def run_archiver_logic():
     log("🚀 Thread started.")
+    
+    # Small delay to ensure thread is detached from event loop
+    time.sleep(0.5)
     
     # Paths
     state_path = os.path.join(DATA_DIR, STORAGE_STATE_FILE)
@@ -177,7 +216,8 @@ def run_archiver_logic():
             with open(last_ids_path, 'r') as f: last_ids = json.load(f)
         except: pass
 
-    with sync_playwright() as p:
+    try:
+        with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS_MODE, args=['--disable-blink-features=AutomationControlled'])
         
         # Determine context storage
@@ -223,6 +263,15 @@ def run_archiver_logic():
                         context.storage_state(path=state_path)
                         supabase_utils.upload_file(state_path, SUPABASE_BUCKET, remote_state_path, debug=False)
                         log("✅ Login saved.")
+                    else:
+                        # Login failed after 2 minutes
+                        log("❌ Login failed after 2 minutes. Session expired or captcha blocking.")
+                        send_alert_email(
+                            "Login Failed - Manual Intervention Required",
+                            "Discord login failed after 2 minutes.\nPossible causes:\n- Captcha required\n- Session expired\n- 2FA needed\n\nPlease restart from the web service when ready."
+                        )
+                        # Wait a bit before retrying
+                        time.sleep(300)  # Wait 5 minutes before retrying login
                 
                 # 2. Scrape Channels
                 for channel_url in CHANNELS:
@@ -339,6 +388,17 @@ def run_archiver_logic():
         
         context.close()
         browser.close()
+    
+    except Exception as e:
+        log(f"❌ Fatal Playwright Error: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Send critical error alert
+        send_alert_email(
+            "Critical Playwright Error",
+            f"The scraper crashed with error:\n{str(e)}\n\nThis may be due to:\n- Event loop conflicts\n- Browser crashes\n- Severe network issues\n\nManually restart the service from Render dashboard."
+        )
     
     set_status("STOPPED")
 
