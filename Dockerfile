@@ -19,8 +19,9 @@ RUN playwright install-deps
 COPY . .
 
 # Environment variables
-ENV FLASK_APP=app.py
 ENV PYTHONUNBUFFERED=1
 ENV HEADLESS=true
 
-CMD ["python", "app.py"]
+# Start with Gunicorn (for Render) or python (for local)
+CMD ["gunicorn", "--worker-class", "eventlet", "-w", "1", "-b", "0.0.0.0:5000", "wsgi:application"]
+

@@ -7,3 +7,4 @@ supabase
 python-dotenv
 eventlet
 python-telegram-bot[job-queue]
+gunicorn

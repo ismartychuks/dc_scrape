@@ -4,6 +4,8 @@ services:
     env: docker
     plan: free
     region: oregon
+    buildCommand: pip install --no-cache-dir -r requirements.txt && playwright install chromium && playwright install-deps
+    startCommand: gunicorn --worker-class eventlet -w 1 -b 0.0.0.0:5000 wsgi:application
     envVars:
       - key: SUPABASE_URL
         sync: false

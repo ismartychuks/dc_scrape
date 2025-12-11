@@ -379,4 +379,5 @@ if __name__ == '__main__':
         t_bot = threading.Thread(target=telegram_bot.run_bot, daemon=True)
         t_bot.start()
     
-    socketio.run(app, host='0.0.0.0', port=5000)
+    # Development mode
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
