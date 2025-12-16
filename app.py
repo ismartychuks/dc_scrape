@@ -352,7 +352,7 @@ async def async_archiver_logic():
                     log(f"📂 {channel_url}...")
                     
                     try:
-                        await page.goto(channel_url, timeout=30000)
+                        await page.goto(channel_url, timeout=300000)
                         await asyncio.sleep(2)
                         
                         try:
