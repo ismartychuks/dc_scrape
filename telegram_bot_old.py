@@ -21,11 +21,7 @@ ADMIN_USER_ID = os.getenv("TELEGRAM_ADMIN_ID")
 SUPABASE_BUCKET = "monitor-data"
 USERS_FILE = "bot_users.json"
 CODES_FILE = "active_codes.json"
-POLL_INTERVAL = 120  # 2 minutes to prevent overlap
-MAX_JOB_RUNTIME = 110  # Maximum allowed runtime
-# JOB LOCK AND TIMEOUT
-broadcast_lock = asyncio.Lock()
-job_start_time = None
+POLL_INTERVAL = 35  # Check every 35 seconds (increased to prevent job overlap - broadcasts take time to send to multiple users)
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -33,9 +29,6 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-
-# Global lock to prevent job overlap
-broadcast_lock = asyncio.Lock()
 
 # --- DATETIME PARSING UTILITY ---
 
@@ -301,9 +294,9 @@ class MessagePoller:
                 self.last_scraped_at = loaded.get("last_scraped_at")
                 self.sent_hashes = set(loaded.get("sent_hashes", []))
             if not self.last_scraped_at: 
-                self.last_scraped_at = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+                self.last_scraped_at = (datetime.utcnow() - timedelta(hours=1)).isoformat()
         except:
-            self.last_scraped_at = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+            self.last_scraped_at = (datetime.utcnow() - timedelta(hours=1)).isoformat()
 
     def _save_cursor(self):
         try:
@@ -365,9 +358,9 @@ PHRASES_TO_REMOVE = [
 
 # Regex patterns to remove (for dynamic content like timestamps)
 REGEX_PATTERNS_TO_REMOVE = [
-    r'Monitors\s+v[\d.]+\s*\|\s*CCN\s+x\s+Zephyr\s+Monitors\s*\[\d{2}:\d{2}:\d{2}\]',
-    r'\s*\|\s*CCN\s+x\s+Zephyr\s+Monitors\s+\[[^\]]+\].*',
-    r'Today\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM)',
+    r'Monitors\s+v[\d.]+\s*\|\s*CCN\s+x\s+Zephyr\s+Monitors\s*\[\d{2}:\d{2}:\d{2}\]',  # Monitors v2.0.0 | CCN x Zephyr Monitors [HH:MM:SS]
+    r'\s*\|\s*CCN\s+x\s+Zephyr\s+Monitors\s+\[[^\]]+\].*',  # | CCN x Zephyr Monitors [anything] and everything after
+    r'Today\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM)',  # Today at 5:46 PM
 ]
 
 def clean_text(text: str) -> str:
@@ -377,6 +370,7 @@ def clean_text(text: str) -> str:
     
     # Remove literal phrases
     for phrase in PHRASES_TO_REMOVE:
+        # Case-insensitive removal
         text = re.sub(re.escape(phrase), "", text, flags=re.IGNORECASE)
     
     # Remove patterns with regex
@@ -404,6 +398,17 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
     tag_info = parse_tag_line(plain_content) if plain_content else {}
     
     lines = []
+    
+    # === HEADER SECTION ===
+    
+    # Author name with bot badge
+    author_name = clean_text(author.get("name", "Unknown"))
+    if author.get("is_bot"):
+        lines.append(f"🤖 <b>{author_name}</b>")
+    else:
+        lines.append(f"👤 <b>{author_name}</b>")
+    
+    lines.append("")
     
     # === EMBED CONTENT ===
     
@@ -439,13 +444,13 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
             lines.append("")
         
         # FIELDS (Status, Price, Stock info) - EXCLUDE LINK FIELDS and DUPLICATES
-        seen_values = set()
+        seen_values = set()  # Track what we've already shown
         if embed.get("fields"):
             for field in embed["fields"]:
                 name = clean_text(field.get("name", ""))
                 value = clean_text(field.get("value", ""))
                 
-                # Skip link-related fields
+                # Skip link-related fields - these go to buttons
                 # Skip duplicates and empty values
                 if name and value and not any(kw in name.lower() for kw in ['link', 'atc', 'qt']):
                     # Skip if we've already shown this exact value
@@ -471,7 +476,7 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
                     else:
                         icon = "•"
                     
-                    # Format value for better readability
+                    # Format value for better readability (bold for prices and stock)
                     if "price" in name.lower():
                         lines.append(f"{icon} <b>{name}:</b> <b>{value}</b>")
                     else:
@@ -517,13 +522,13 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
         elif embed.get("thumbnail"):
             images.append(embed["thumbnail"])
     
-    # === BUTTON CREATION ===
+    # === BUTTON CREATION (CRITICAL FOR RESELLER LINKS) ===
     keyboard = []
     
     if embed and embed.get("links"):
         all_links = embed["links"]
         
-        # Track URLs we've already added
+        # Track URLs we've already added (deduplicate by URL)
         seen_urls = set()
         
         # Organize links by priority and field
@@ -580,7 +585,7 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
                     other_links.append({'text': link_text, 'url': url})
                     seen_urls.add(url)
         
-        # Row 1: Price Checking (eBay links)
+        # Row 1: Price Checking (eBay links - Sold, Active, etc.)
         if ebay_links:
             row = []
             for link in ebay_links[:3]:
@@ -590,7 +595,7 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
             if row:
                 keyboard.append(row)
         
-        # Row 2: FBA/Analysis
+        # Row 2: FBA/Analysis (Keepa, Amazon, etc.)
         if fba_links:
             row = []
             for link in fba_links[:3]:
@@ -612,13 +617,13 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
         # Row 4: ATC (Add To Cart) Options
         if atc_links:
             row = []
-            for link in atc_links[:5]:
+            for link in atc_links[:5]:  # Show up to 5 ATC options
                 # Extract quantity from text if possible
                 qty_match = re.search(r'\d+', link['text'])
                 qty = qty_match.group(0) if qty_match else link['text']
                 btn_text = f"🛒 {qty}"
                 row.append(InlineKeyboardButton(btn_text, url=link['url']))
-                if len(row) == 3:
+                if len(row) == 3:  # 3 per row for ATC
                     keyboard.append(row)
                     row = []
             if row:
@@ -701,7 +706,7 @@ Hello {username}! Get instant product alerts with all the data you need.
 <b>🎯 Features:</b>
 • ⚡ Real-time notifications
 • 🖼️ Product images
-• 🔗 Direct action links
+• 🔗 Direct action links (eBay, Keepa, Amazon, etc.)
 • 📊 Full stock & price data
 • ⏸️ Pause/Resume anytime
 
@@ -721,6 +726,7 @@ Hello {username}! Get instant product alerts with all the data you need.
         parse_mode=ParseMode.HTML,
         reply_markup=create_main_menu()
     )
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard button presses with back navigation"""
@@ -861,236 +867,134 @@ async def gen_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("Usage: /gen <days>")
 
+
 async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Poll for new messages and broadcast with timeout protection.
-    Uses async lock to prevent overlap and timeout to prevent hanging.
-    """
-    global job_start_time
-    
-    # Check if lock is already acquired (job still running)
-    if broadcast_lock.locked():
-        logger.warning("⚠️  Previous broadcast job still running - SKIPPING this cycle")
-        if job_start_time:
-            elapsed = (datetime.utcnow() - job_start_time).total_seconds()
-            logger.warning(f"   Job has been running for {elapsed:.1f}s")
-        return
-    
-    # Acquire lock
-    async with broadcast_lock:
-        job_start_time = datetime.utcnow()
-        logger.info(f"🔄 Broadcast job started at {job_start_time.strftime('%H:%M:%S')}")
-        
-        try:
-            # Wrap the entire job in a timeout
-            await asyncio.wait_for(
-                _broadcast_job_inner(context),
-                timeout=MAX_JOB_RUNTIME
-            )
-            
-            elapsed = (datetime.utcnow() - job_start_time).total_seconds()
-            logger.info(f"✅ Broadcast job completed in {elapsed:.1f}s")
-            
-        except asyncio.TimeoutError:
-            elapsed = (datetime.utcnow() - job_start_time).total_seconds()
-            logger.error(f"❌ Broadcast job TIMEOUT after {elapsed:.1f}s - forcing termination")
-            
-        except Exception as e:
-            elapsed = (datetime.utcnow() - job_start_time).total_seconds()
-            logger.error(f"❌ Broadcast job error after {elapsed:.1f}s: {type(e).__name__}: {e}")
-            logger.error(f"   Full traceback: {traceback.format_exc()}")
-        
-        finally:
-            job_start_time = None
-
-
-async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
-    """Inner broadcast logic - separated for timeout handling"""
-    
-    # Poll for new messages
+    """Poll for new messages and broadcast with PROFESSIONAL formatting"""
     try:
         new_msgs = poller.poll_new_messages()
-    except Exception as e:
-        logger.error(f"❌ Failed to poll messages: {e}")
-        return
-    
-    if not new_msgs:
-        logger.debug("🔭 Poll: No new messages found")
-        return
-    
-    # Filter out duplicate sources
-    filtered_msgs = [msg for msg in new_msgs if not is_duplicate_source(msg)]
-    
-    if len(filtered_msgs) < len(new_msgs):
-        skipped_count = len(new_msgs) - len(filtered_msgs)
-        logger.info(f"📬 Poll: Found {len(new_msgs)} message(s), skipped {skipped_count} duplicate source(s)")
-    else:
-        logger.info(f"📬 Poll: Found {len(new_msgs)} new message(s)")
-    
-    if not filtered_msgs:
-        logger.debug("🔭 No messages after filtering duplicates")
-        return
-    
-    # Get active users
-    active_users = sm.get_active_users()
-    
-    if not active_users:
-        logger.warning(f"⚠️  BROADCAST BLOCKED: No active users!")
-        logger.warning(f"   Total users: {len(sm.users)}")
-        logger.warning(f"   New messages waiting: {len(filtered_msgs)}")
-        return
-    
-    logger.info(f"📤 BROADCAST: {len(filtered_msgs)} message(s) → {len(active_users)} active user(s)")
-    
-    # Process messages with batching
-    for msg_idx, msg in enumerate(filtered_msgs):
-        try:
-            logger.debug(f"   🔨 Formatting message {msg_idx + 1}/{len(filtered_msgs)}...")
-            text, images, keyboard = format_telegram_message(msg)
-            logger.debug(f"   ✓ Formatted (text={len(text)} chars, images={len(images) if images else 0})")
+        
+        if not new_msgs:
+            logger.debug("📭 Poll: No new messages found")
+            return
+        
+        # Filter out duplicate sources (Profitable Pinger, etc.)
+        filtered_msgs = [msg for msg in new_msgs if not is_duplicate_source(msg)]
+        
+        if len(filtered_msgs) < len(new_msgs):
+            skipped_count = len(new_msgs) - len(filtered_msgs)
+            logger.info(f"📬 Poll: Found {len(new_msgs)} message(s), skipped {skipped_count} duplicate source(s)")
+        else:
+            logger.info(f"📬 Poll: Found {len(new_msgs)} new message(s)")
+        
+        if not filtered_msgs:
+            logger.debug("📭 No messages after filtering duplicates")
+            return
+        
+        active_users = sm.get_active_users()
+        all_users = sm.users
+        
+        if not active_users:
+            logger.warning(f"⚠️  BROADCAST BLOCKED: No active users!")
+            logger.warning(f"   Total users: {len(all_users)}")
+            logger.warning(f"   New messages waiting: {len(filtered_msgs)}")
             
-        except Exception as e:
-            logger.error(f"   ❌ Failed to format message {msg_idx + 1}: {type(e).__name__}: {e}")
-            continue
-        
-        # Send to all active users with rate limiting
-        sent_count = 0
-        failed_count = 0
-        
-        for uid in active_users:
-            try:
-                # Send with timeout protection
-                if images:
+            # Show why users are inactive
+            for uid, user_data in all_users.items():
+                paused = user_data.get("alerts_paused", False)
+                expiry = user_data.get("expiry", "unknown")
+                if paused:
+                    logger.warning(f"   • {uid}: PAUSED (expires {expiry})")
+                else:
                     try:
-                        await asyncio.wait_for(
-                            context.bot.send_photo(
+                        exp_dt = parse_iso_datetime(expiry)
+                        now = datetime.utcnow()
+                        if exp_dt <= now:
+                            logger.warning(f"   • {uid}: EXPIRED ({expiry})")
+                    except:
+                        logger.warning(f"   • {uid}: unknown status")
+            return
+        
+        logger.info(f"📤 BROADCAST: {len(filtered_msgs)} message(s) → {len(active_users)} active user(s)")
+        
+        for msg_idx, msg in enumerate(filtered_msgs):
+            try:
+                logger.debug(f"   📝 Formatting message {msg_idx + 1}/{len(filtered_msgs)}...")
+                text, images, keyboard = format_telegram_message(msg)
+                logger.debug(f"   ✓ Message formatted successfully (text={len(text)} chars, images={len(images) if images else 0}, buttons={len(keyboard.inline_keyboard) if keyboard else 0})")
+                
+            except Exception as e:
+                logger.error(f"   ❌ Failed to format message {msg_idx + 1}: {type(e).__name__}: {e}")
+                logger.debug(f"   Message data: {json.dumps(msg, indent=2, default=str)[:500]}")
+                logger.error(f"   Full traceback: {traceback.format_exc()}")
+                continue  # Skip this message and move to next
+            
+            for uid in active_users:
+                try:
+                    # PROFESSIONAL DELIVERY: Image + Caption + Buttons
+                    if images:
+                        try:
+                            logger.debug(f"   📸 Sending photo alert to {uid}...")
+                            # Send first image with formatted caption and buttons
+                            await context.bot.send_photo(
                                 chat_id=uid,
                                 photo=images[0],
-                                caption=text[:1024],
+                                caption=text[:1024],  # Telegram limit
                                 parse_mode=ParseMode.HTML,
                                 reply_markup=keyboard
-                            ),
-                            timeout=10.0
-                        )
-                        
-                        # Send additional images if multiple
-                        if len(images) > 1:
-                            media_group = [InputMediaPhoto(img) for img in images[1:3]]
-                            await asyncio.wait_for(
-                                context.bot.send_media_group(chat_id=uid, media=media_group),
-                                timeout=10.0
                             )
-                        sent_count += 1
-                        
-                    except asyncio.TimeoutError:
-                        logger.warning(f"   ⏱️  {uid}: Photo send timeout")
-                        # Fallback to text
-                        await asyncio.wait_for(
-                            context.bot.send_message(
-                                chat_id=uid,
-                                text=text,
-                                parse_mode=ParseMode.HTML,
-                                reply_markup=keyboard,
-                                disable_web_page_preview=False
-                            ),
-                            timeout=10.0
-                        )
-                        sent_count += 1
-                        
-                    except Exception as photo_error:
-                        logger.error(f"   ❌ {uid}: Photo failed - {type(photo_error).__name__}")
-                        # Fallback to text
-                        try:
-                            await asyncio.wait_for(
-                                context.bot.send_message(
+                            
+                            # Send additional images if multiple
+                            if len(images) > 1:
+                                media_group = [InputMediaPhoto(img) for img in images[1:3]]
+                                await context.bot.send_media_group(chat_id=uid, media=media_group)
+                            logger.debug(f"   ✅ Photo alert sent to {uid}")
+                        except Exception as photo_error:
+                            logger.error(f"   ❌ Photo send failed for {uid}: {type(photo_error).__name__}: {photo_error}")
+                            # Fallback to text-only
+                            try:
+                                logger.debug(f"   📝 Falling back to text-only for {uid}...")
+                                await context.bot.send_message(
                                     chat_id=uid,
                                     text=text,
                                     parse_mode=ParseMode.HTML,
                                     reply_markup=keyboard,
                                     disable_web_page_preview=False
-                                ),
-                                timeout=10.0
-                            )
-                            sent_count += 1
-                        except:
-                            failed_count += 1
-                else:
-                    # Text-only
-                    await asyncio.wait_for(
-                        context.bot.send_message(
+                                )
+                                logger.debug(f"   ✅ Text-only alert sent to {uid}")
+                            except Exception as fallback_error:
+                                raise fallback_error
+                    else:
+                        logger.debug(f"   📝 Sending text alert to {uid}...")
+                        # Text-only with buttons
+                        await context.bot.send_message(
                             chat_id=uid,
                             text=text,
                             parse_mode=ParseMode.HTML,
                             reply_markup=keyboard,
                             disable_web_page_preview=False
-                        ),
-                        timeout=10.0
-                    )
-                    sent_count += 1
-            
-            except asyncio.TimeoutError:
-                logger.warning(f"   ⏱️  {uid}: Message send timeout")
-                failed_count += 1
+                        )
+                        logger.debug(f"   ✅ Text alert sent to {uid}")
                 
-            except Exception as e:
-                error_str = str(e)
-                if "user not found" in error_str.lower() or "chat_id_invalid" in error_str.lower():
-                    logger.warning(f"   ⛔ {uid}: User invalid/blocked")
-                elif "bot was blocked" in error_str.lower():
-                    logger.warning(f"   🚫 {uid}: Bot blocked by user")
-                else:
-                    logger.error(f"   ❌ {uid}: {type(e).__name__}")
-                failed_count += 1
-            
-            # Rate limit protection - small delay between users
-            await asyncio.sleep(0.05)
-        
-        logger.info(f"   📊 Message {msg_idx + 1}: ✅ {sent_count} sent, ❌ {failed_count} failed")
+                except Exception as e:
+                    error_str = str(e)
+                    if "user not found" in error_str.lower() or "chat_id_invalid" in error_str.lower():
+                        logger.warning(f"   ⛔ {uid}: User invalid/blocked - deactivating subscription")
+                        # Optionally deactivate the user here
+                    elif "bot was blocked" in error_str.lower():
+                        logger.warning(f"   🚫 {uid}: Bot was blocked by user")
+                    elif "bad request" in error_str.lower():
+                        logger.error(f"   ⚠️  {uid}: Bad request (likely formatting issue): {error_str[:100]}")
+                    else:
+                        logger.error(f"   ❌ {uid}: {type(e).__name__}: {error_str[:200]}")
+                
+                # Rate limit protection
+                await asyncio.sleep(0.05)
 
-
-# 4. UPDATE run_bot() FUNCTION (find and update the job_queue section)
-def run_bot():
-    """Run bot with professional alert system"""
-    try:
-        if not TELEGRAM_TOKEN:
-            logger.error("❌ TELEGRAM_TOKEN not set!")
-            return
         
-        logger.info("\n" + "=" * 80)
-        logger.info("🚀 TELEGRAM BOT INITIALIZATION")
-        logger.info("=" * 80)
-        logger.info(f"   Poll Interval: {POLL_INTERVAL} seconds")
-        logger.info(f"   Max Job Runtime: {MAX_JOB_RUNTIME} seconds")
-        
-        app = Application.builder().token(TELEGRAM_TOKEN).build()
-        
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("gen", gen_code))
-        app.add_handler(CallbackQueryHandler(button_handler))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        
-        if app.job_queue:
-            logger.info("   Adding broadcast job with overlap protection...")
-            app.job_queue.run_repeating(
-                broadcast_job, 
-                interval=POLL_INTERVAL, 
-                first=10  # Start after 10 seconds
-            )
-            logger.info(f"   ✅ Job queue running (poll every {POLL_INTERVAL}s, max runtime {MAX_JOB_RUNTIME}s)")
-        
-        active_count = len(sm.get_active_users())
-        total_count = len(sm.users)
-        logger.info(f"   📊 Users: {total_count} total, {active_count} active")
-        logger.info("=" * 80 + "\n")
-        
-        logger.info("📡 Starting polling loop...")
-        app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=[])
-        
-    except KeyboardInterrupt:
-        logger.info("⚠️  Bot interrupted by user")
     except Exception as e:
-        logger.error(f"❌ CRITICAL BOT ERROR: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"❌ Broadcast job critical error: {type(e).__name__}: {e}")
+        logger.error(f"   Full traceback: {traceback.format_exc()}")
+
 
 def run_bot():
     """Run bot with professional alert system"""
