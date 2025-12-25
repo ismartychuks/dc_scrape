@@ -315,6 +315,39 @@ class SubscriptionManager:
                         admins.append(uid)
         return admins
 
+    def get_expired_users_needing_reminder(self) -> List[str]:
+        """Get users with expired subscriptions who haven't been reminded in 14 days"""
+        needing_reminder = []
+        now = datetime.utcnow()
+        with self.lock:
+            for uid, data in self.users.items():
+                try:
+                    expiry = parse_iso_datetime(data["expiry"])
+                    if expiry < now:
+                        last_reminder_str = data.get("last_expiry_reminder")
+                        should_remind = False
+                        
+                        if not last_reminder_str:
+                            should_remind = True
+                        else:
+                            last_reminder = parse_iso_datetime(last_reminder_str)
+                            if (now - last_reminder).days >= 14:
+                                should_remind = True
+                        
+                        if should_remind:
+                            needing_reminder.append(uid)
+                except Exception as e:
+                    logger.error(f"Error checking reminder for {uid}: {e}")
+        return needing_reminder
+
+    def update_reminder_timestamp(self, user_id: str):
+        """Update last_expiry_reminder timestamp only and sync to Supabase"""
+        with self.lock:
+            uid = str(user_id)
+            if uid in self.users:
+                self.users[uid]["last_expiry_reminder"] = datetime.utcnow().isoformat()
+                self._sync_state()
+
 
 # --- MESSAGE POLLER ---
 
@@ -878,6 +911,9 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
     return text, images, InlineKeyboardMarkup(keyboard) if keyboard else None
 
 
+    return False
+
+
 def is_duplicate_source(msg_data: Dict) -> bool:
     """
     Check if message is from a duplicate source (like Profitable Pinger).
@@ -918,7 +954,35 @@ def is_duplicate_source(msg_data: Dict) -> bool:
         if "profitable pinger" in title or "profitable pinger" in desc:
             return True
 
+    return False
 
+
+def is_restock_filter_match(msg_data: Dict) -> bool:
+    """
+    Check if message contains "Just restocked for" phrase.
+    These are filtered out based on user request.
+    """
+    content = (msg_data.get("content") or "").lower()
+    if "just restocked for" in content:
+        return True
+    
+    raw = msg_data.get("raw_data", {})
+    embed = raw.get("embed") or {}
+    
+    # Check title and description
+    title = (embed.get("title") or "").lower()
+    desc = (embed.get("description") or "").lower()
+    if "just restocked for" in title or "just restocked for" in desc:
+        return True
+    
+    # Check fields
+    if embed.get("fields"):
+        for field in embed["fields"]:
+            val = (field.get("value") or "").lower()
+            name = (field.get("name") or "").lower()
+            if "just restocked for" in val or "just restocked for" in name:
+                return True
+                
     return False
 
 
@@ -1275,6 +1339,48 @@ async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
             job_start_time = None
 
 
+async def expiry_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """Notify users with expired subscriptions once every two weeks"""
+    expired_uids = sm.get_expired_users_needing_reminder()
+    if not expired_uids:
+        return
+
+    logger.info(f"⏰ EXPIRY REMINDERS: Sending to {len(expired_uids)} user(s)")
+    
+    reminder_text = """
+⚠️ <b>Subscription Expired</b>
+
+Your access to professional Discord alerts has expired. 
+
+To continue receiving real-time notifications with product images and direct links, please redeem a new subscription code.
+
+🎟️ <b>How to renew:</b>
+1. Contact your administrator for a new code.
+2. Use the <b>"🎟️ Redeem Code"</b> button in the main menu.
+3. Paste your code to reactivate instantly!
+
+<i>You will receive a reminder every two weeks.</i>
+"""
+    
+    sent = 0
+    for uid in expired_uids:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=reminder_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=create_main_menu()
+            )
+            sm.update_reminder_timestamp(uid)
+            sent += 1
+            await asyncio.sleep(0.1)  # Small delay between users
+        except Exception as e:
+            logger.error(f"Failed to send expiry reminder to {uid}: {e}")
+            
+    if sent > 0:
+        logger.info(f"✅ Sent {sent} expiry reminder(s)")
+
+
 async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
     """Inner broadcast logic - separated for timeout handling"""
     
@@ -1289,8 +1395,11 @@ async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
         logger.debug("🔭 Poll: No new messages found")
         return
     
-    # Filter out duplicate sources
-    filtered_msgs = [msg for msg in new_msgs if not is_duplicate_source(msg)]
+    # Filter out duplicate sources and unwanted restock alerts
+    filtered_msgs = [
+        msg for msg in new_msgs 
+        if not is_duplicate_source(msg) and not is_restock_filter_match(msg)
+    ]
     
     if len(filtered_msgs) < len(new_msgs):
         skipped_count = len(new_msgs) - len(filtered_msgs)
@@ -1473,6 +1582,15 @@ def run_bot():
                 interval=POLL_INTERVAL, 
                 first=10
             )
+
+            # Register expiry reminders (Check daily)
+            logger.info("   Adding bi-weekly expiry reminder job...")
+            app.job_queue.run_repeating(
+                expiry_reminder_job,
+                interval=86400, # Once a day
+                first=30        # Start after 30 seconds
+            )
+            
             logger.info(f"   ✅ Job queue running (poll every {POLL_INTERVAL}s)")
         
         # Show active users count on startup
