@@ -1122,7 +1122,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username or update.effective_user.first_name
     
     welcome_text = f"""
-👋 <b>Welcome to Professional Discord Alerts!</b>
+👋 <b>Welcome to KTTYDROPS!</b>
 
 Hello {username}! Get instant product alerts with all the data you need.
 
@@ -1377,7 +1377,7 @@ async def expiry_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     reminder_text = """
 ⚠️ <b>Subscription Expired</b>
 
-Your access to professional Discord alerts has expired. 
+Your access to KTTYDROPS has expired. 
 
 To continue receiving real-time notifications with product images and direct links, please redeem a new subscription code.
 
