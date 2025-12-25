@@ -277,8 +277,43 @@ class SubscriptionManager:
             "days_remaining": (expiry - now).days if expiry > now else 0,
             "days_active": (now - joined).days,
             "is_paused": user_data.get("alerts_paused", False),
-            "expiry_date": expiry.strftime("%Y-%m-%d %H:%M UTC")
+            "expiry_date": expiry.strftime("%Y-%m-%d %H:%M UTC"),
+            "is_admin": user_data.get("is_admin", False)
         }
+
+    def add_admin(self, user_id: str) -> bool:
+        """Set a user as admin"""
+        with self.lock:
+            if str(user_id) not in self.users:
+                # Add a placeholder user if they don't exist yet? 
+                # Or just error out. Let's assume they must be in the system.
+                return False
+            self.users[str(user_id)]["is_admin"] = True
+            self._sync_state()
+            return True
+
+    def remove_admin(self, user_id: str) -> bool:
+        """Remove admin status from a user"""
+        with self.lock:
+            if str(user_id) in self.users:
+                self.users[str(user_id)]["is_admin"] = False
+                self._sync_state()
+                return True
+            return False
+
+    def is_bot_admin(self, user_id: str) -> bool:
+        """Check if a user is a secondary admin"""
+        return self.users.get(str(user_id), {}).get("is_admin", False)
+
+    def get_all_admins(self) -> List[str]:
+        """Get list of all admin IDs (Superadmin + Secondary)"""
+        admins = [str(ADMIN_USER_ID)]
+        with self.lock:
+            for uid, data in self.users.items():
+                if data.get("is_admin"):
+                    if uid not in admins:
+                        admins.append(uid)
+        return admins
 
 
 # --- MESSAGE POLLER ---
@@ -286,7 +321,7 @@ class SubscriptionManager:
 class MessagePoller:
     def __init__(self):
         self.last_scraped_at = None
-        self.sent_hashes = set()
+        self.sent_ids = set()
         self.supabase_url, self.supabase_key = supabase_utils.get_supabase_config()
         self.cursor_file = "bot_cursor.json"
         self.local_path = f"data/{self.cursor_file}"
@@ -299,7 +334,8 @@ class MessagePoller:
             if data: 
                 loaded = json.loads(data)
                 self.last_scraped_at = loaded.get("last_scraped_at")
-                self.sent_hashes = set(loaded.get("sent_hashes", []))
+                # Support migration from sent_hashes to sent_ids
+                self.sent_ids = set(loaded.get("sent_ids", loaded.get("sent_hashes", [])))
             if not self.last_scraped_at: 
                 self.last_scraped_at = (datetime.utcnow() - timedelta(hours=24)).isoformat()
         except:
@@ -310,7 +346,7 @@ class MessagePoller:
             with open(self.local_path, 'w') as f: 
                 json.dump({
                     "last_scraped_at": self.last_scraped_at,
-                    "sent_hashes": list(self.sent_hashes)[-1000:]
+                    "sent_ids": list(self.sent_ids)[-1000:]
                 }, f)
             supabase_utils.upload_file(self.local_path, SUPABASE_BUCKET, self.remote_path, debug=False)
         except: pass
@@ -329,13 +365,13 @@ class MessagePoller:
             
             messages = res.json()
             
-            # Filter duplicates by content hash
+            # Filter duplicates by message ID (Discord ID)
             new_messages = []
             for msg in messages:
-                content_hash = msg.get("raw_data", {}).get("content_hash")
-                if content_hash and content_hash not in self.sent_hashes:
+                msg_id = msg.get("id")
+                if msg_id and msg_id not in self.sent_ids:
                     new_messages.append(msg)
-                    self.sent_hashes.add(content_hash)
+                    self.sent_ids.add(msg_id)
             
             # DO NOT update cursor here - will be updated after successful broadcast
             
@@ -352,6 +388,26 @@ class MessagePoller:
 
 sm = SubscriptionManager()
 poller = MessagePoller()
+
+# --- ADMIN PERMISSION HELPERS ---
+
+def is_superadmin(user_id: str) -> bool:
+    """Check if user is the main admin from .env"""
+    return str(user_id) == str(ADMIN_USER_ID)
+
+def is_admin(user_id: str) -> bool:
+    """Check if user is either superadmin or secondary admin"""
+    uid_str = str(user_id)
+    return is_superadmin(uid_str) or sm.is_bot_admin(uid_str)
+
+async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Notify all admins of an event/error"""
+    admin_ids = sm.get_all_admins()
+    for aid in admin_ids:
+        try:
+            await context.bot.send_message(chat_id=aid, text=text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error(f"Failed to notify admin {aid}: {e}")
 
 
 # --- PROFESSIONAL MESSAGE FORMATTING ---
@@ -893,7 +949,7 @@ async def test_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Usage: /test [N] (default 1)
     """
     user_id = str(update.effective_user.id)
-    if user_id != ADMIN_USER_ID:
+    if not is_admin(user_id):
         await update.message.reply_text("⛔ Admin only.")
         return
 
@@ -1129,7 +1185,7 @@ Use /start for the menu.
 
 async def gen_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: Generate codes"""
-    if str(update.effective_user.id) != str(ADMIN_USER_ID): 
+    if not is_admin(update.effective_user.id): 
         return
     
     try:
@@ -1141,6 +1197,38 @@ async def gen_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except:
         await update.message.reply_text("Usage: /gen <days>")
+
+async def add_bot_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Superadmin: Add a new admin"""
+    if not is_superadmin(update.effective_user.id):
+        await update.message.reply_text("⛔ Only the superadmin can add other admins.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /add_admin <user_id>")
+        return
+    
+    target_id = context.args[0]
+    if sm.add_admin(target_id):
+        await update.message.reply_text(f"✅ User <code>{target_id}</code> is now an admin.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(f"❌ Could not add user <code>{target_id}</code> as admin. Make sure they have interacted with the bot first.", parse_mode=ParseMode.HTML)
+
+async def remove_bot_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Superadmin: Remove an admin"""
+    if not is_superadmin(update.effective_user.id):
+        await update.message.reply_text("⛔ Only the superadmin can remove other admins.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /remove_admin <user_id>")
+        return
+    
+    target_id = context.args[0]
+    if sm.remove_admin(target_id):
+        await update.message.reply_text(f"✅ User <code>{target_id}</code> is no longer an admin.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(f"❌ User <code>{target_id}</code> not found or not an admin.", parse_mode=ParseMode.HTML)
 
 async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1178,8 +1266,10 @@ async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
             
         except Exception as e:
             elapsed = (datetime.utcnow() - job_start_time).total_seconds()
+            err_msg = f"❌ <b>Broadcast job error</b> after {elapsed:.1f}s: {type(e).__name__}: {e}"
             logger.error(f"❌ Broadcast job error after {elapsed:.1f}s: {type(e).__name__}: {e}")
             logger.error(f"   Full traceback: {traceback.format_exc()}")
+            await notify_admins(context, err_msg)
         
         finally:
             job_start_time = None
@@ -1370,6 +1460,8 @@ def run_bot():
         # Command Handlers
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("gen", gen_code))
+        app.add_handler(CommandHandler("add_admin", add_bot_admin))
+        app.add_handler(CommandHandler("remove_admin", remove_bot_admin))
         app.add_handler(CommandHandler("test", test_alerts))  # New Test Command
         app.add_handler(CallbackQueryHandler(button_handler))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

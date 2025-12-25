@@ -21,7 +21,11 @@ ADMIN_USER_ID = os.getenv("TELEGRAM_ADMIN_ID")
 SUPABASE_BUCKET = "monitor-data"
 USERS_FILE = "bot_users.json"
 CODES_FILE = "active_codes.json"
-POLL_INTERVAL = 35  # Check every 35 seconds (increased to prevent job overlap - broadcasts take time to send to multiple users)
+POLL_INTERVAL = 120  # 2 minutes to prevent overlap
+MAX_JOB_RUNTIME = 110  # Maximum allowed runtime
+# JOB LOCK AND TIMEOUT
+broadcast_lock = asyncio.Lock()
+job_start_time = None
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -29,6 +33,9 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+# Global lock to prevent job overlap
+broadcast_lock = asyncio.Lock()
 
 # --- DATETIME PARSING UTILITY ---
 
@@ -294,9 +301,9 @@ class MessagePoller:
                 self.last_scraped_at = loaded.get("last_scraped_at")
                 self.sent_hashes = set(loaded.get("sent_hashes", []))
             if not self.last_scraped_at: 
-                self.last_scraped_at = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+                self.last_scraped_at = (datetime.utcnow() - timedelta(hours=24)).isoformat()
         except:
-            self.last_scraped_at = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+            self.last_scraped_at = (datetime.utcnow() - timedelta(hours=24)).isoformat()
 
     def _save_cursor(self):
         try:
@@ -311,13 +318,13 @@ class MessagePoller:
     def poll_new_messages(self):
         try:
             if not self.last_scraped_at: 
-                self.last_scraped_at = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+                self.last_scraped_at = (datetime.utcnow() - timedelta(minutes=45)).isoformat()
             
             headers = {"apikey": self.supabase_key, "Authorization": f"Bearer {self.supabase_key}"}
             url = f"{self.supabase_url}/rest/v1/discord_messages"
             params = {"scraped_at": f"gt.{self.last_scraped_at}", "order": "scraped_at.asc"}
             
-            res = requests.get(url, headers=headers, params=params, timeout=10)
+            res = requests.get(url, headers=headers, params=params, timeout=45)
             if res.status_code != 200: return []
             
             messages = res.json()
@@ -330,14 +337,17 @@ class MessagePoller:
                     new_messages.append(msg)
                     self.sent_hashes.add(content_hash)
             
-            if messages and isinstance(messages, list):
-                self.last_scraped_at = messages[-1].get('scraped_at')
-                self._save_cursor()
+            # DO NOT update cursor here - will be updated after successful broadcast
             
             return new_messages
         except Exception as e:
             logger.error(f"Poll error: {e}")
             return []
+    
+    def update_cursor(self, scraped_at: str):
+        """Update cursor to given scraped_at timestamp after successful processing"""
+        self.last_scraped_at = scraped_at
+        self._save_cursor()
 
 
 sm = SubscriptionManager()
@@ -358,9 +368,9 @@ PHRASES_TO_REMOVE = [
 
 # Regex patterns to remove (for dynamic content like timestamps)
 REGEX_PATTERNS_TO_REMOVE = [
-    r'Monitors\s+v[\d.]+\s*\|\s*CCN\s+x\s+Zephyr\s+Monitors\s*\[\d{2}:\d{2}:\d{2}\]',  # Monitors v2.0.0 | CCN x Zephyr Monitors [HH:MM:SS]
-    r'\s*\|\s*CCN\s+x\s+Zephyr\s+Monitors\s+\[[^\]]+\].*',  # | CCN x Zephyr Monitors [anything] and everything after
-    r'Today\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM)',  # Today at 5:46 PM
+    r'Monitors\s+v[\d.]+\s*\|\s*CCN\s+x\s+Zephyr\s+Monitors\s*\[\d{2}:\d{2}:\d{2}\]',
+    r'\s*\|\s*CCN\s+x\s+Zephyr\s+Monitors\s+\[[^\]]+\].*',
+    r'Today\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM)',
 ]
 
 def clean_text(text: str) -> str:
@@ -370,7 +380,6 @@ def clean_text(text: str) -> str:
     
     # Remove literal phrases
     for phrase in PHRASES_TO_REMOVE:
-        # Case-insensitive removal
         text = re.sub(re.escape(phrase), "", text, flags=re.IGNORECASE)
     
     # Remove patterns with regex
@@ -382,131 +391,311 @@ def clean_text(text: str) -> str:
     return text
 
 
+# --- CHANNEL SPECIFIC FORMATTERS ---
+
+CHANNEL_COLLECTORS = "1367813504786108526"
+CHANNEL_ARGOS = "855164313006505994"
+CHANNEL_RESTOCKS = "864504557903937587"
+
+def _format_collectors_amazon(msg_data: Dict, embed: Dict) -> Tuple[List[str], List[List[InlineKeyboardButton]]]:
+    """Formatter for Collectors Edge / Amazon V3 (Channel 136...)"""
+    lines = []
+    keyboard = []
+    
+    # 1. Header & Title (Retailer or Author)
+    author_name = msg_data.get("raw_data", {}).get("author", {}).get("name")
+    if not author_name and embed.get("author"):
+        author_name = embed["author"].get("name")
+        
+    if author_name and "unknown" not in author_name.lower():
+        lines.append(f"🏪 <b>{clean_text(author_name)}</b>")
+        lines.append("")
+
+    title = clean_text(embed.get("title", "Product Alert"))
+    lines.append(f"📦 <b>{title}</b>")
+    lines.append("━━━━━━━━━━━━━━━")
+    lines.append("")
+    
+    # 2. ALL Fields (comprehensive)
+    fields = embed.get("fields", [])
+    seen_values = set()
+    
+    for f in fields:
+        name = clean_text(f.get("name", ""))
+        val = clean_text(f.get("value", ""))
+        
+        # Skip link/button fields and N/A values
+        if not name or not val: continue
+        if any(kw in name.lower() for kw in ['link', 'atc', 'qt', 'checkout']): continue
+        if "n/a" in val.lower(): continue
+        if val in seen_values: continue
+        seen_values.add(val)
+        
+        # Smart icon selection
+        name_lower = name.lower()
+        if "price" in name_lower: icon = "💰"
+        elif "stock" in name_lower or "in stock" in name_lower: icon = "✅"
+        elif "type" in name_lower: icon = "🔖"
+        elif "size" in name_lower: icon = "📏"
+        elif "quantity" in name_lower or "qty" in name_lower: icon = "🔢"
+        else: icon = "•"
+        
+        # Add currency symbol and bold prices
+        if "price" in name_lower:
+            # Add £ if no currency symbol present
+            if not any(c in val for c in ['£', '$', '€']):
+                val = f"£{val}"
+            lines.append(f"{icon} <b>{name}:</b> <b>{val}</b>")
+        else:
+            lines.append(f"{icon} <b>{name}:</b> {val}")
+        
+    lines.append("")
+    
+    return lines, []
+
+def _format_argos(msg_data: Dict, embed: Dict) -> Tuple[List[str], List[List[InlineKeyboardButton]]]:
+    """Formatter for Argos Instore (Channel 855...)"""
+    lines = []
+    
+    lines.append("🏪 <b>Argos Instore</b>")
+    lines.append("")
+    
+    title = clean_text(embed.get("title", "Item Restock"))
+    lines.append(f"📦 <b>{title}</b>")
+    lines.append("━━━━━━━━━━━━━━━")
+    lines.append("")
+    
+    # Display ALL fields
+    fields = embed.get("fields", [])
+    seen_values = set()
+    
+    for f in fields:
+        name = clean_text(f.get("name", ""))
+        val = clean_text(f.get("value", ""))
+        
+        if not name or not val: continue
+        if any(kw in name.lower() for kw in ['link', 'atc', 'qt', 'checkout', 'offer id']): continue
+        if "n/a" in val.lower(): continue
+        if val in seen_values: continue
+        seen_values.add(val)
+        
+        name_lower = name.lower()
+        if "store" in name_lower or "availability" in name_lower: icon = "📍"
+        elif "price" in name_lower: icon = "💰"
+        elif "stock" in name_lower: icon = "✅"
+        elif "size" in name_lower: icon = "📏"
+        else: icon = "•"
+        
+        # Add currency to prices
+        if "price" in name_lower and val:
+            if not any(c in val for c in ['£', '$', '€']):
+                val = f"£{val}"
+        
+        lines.append(f"{icon} <b>{name}:</b> {val}")
+    
+    return lines, []
+
+def _format_restocks_currys(msg_data: Dict, embed: Dict) -> Tuple[List[str], List[List[InlineKeyboardButton]]]:
+    """Formatter for Online Restocks / Currys (Channel 864...)"""
+    lines = []
+    
+    # This channel puts "Product Info" with "Just Restocked At..."
+    fields = embed.get("fields", [])
+    prod_info = ""
+    resell = ""
+    price = ""
+    
+    for f in fields:
+        name = clean_text(f.get("name", "")).lower()
+        val = clean_text(f.get("value", ""))
+        if "product info" in name: prod_info = val
+        if "resell" in name and "n/a" not in val.lower(): resell = val
+        if "price" in name and "n/a" not in val.lower(): price = val
+        
+    # Extract site from product info if possible
+    site = "Online Restocks"
+    if "just restocked at" in prod_info.lower():
+        try:
+            site = prod_info.lower().split("just restocked at")[-1].strip()
+            site = site.replace("**", "").strip()
+        except: pass
+        
+    lines.append(f"⚡ <b>{site.upper()}</b>")
+    lines.append("")
+    
+    title = clean_text(embed.get("title", "Product"))
+    lines.append(f"📦 <b>{title}</b>")
+    lines.append("━━━━━━━━━━━━━━━")
+    lines.append("")
+    
+    # Display ALL fields with smart prioritization
+    seen_values = set()
+    for f in fields:
+        name = clean_text(f.get("name", ""))
+        val = clean_text(f.get("value", ""))
+        
+        if not name or not val: continue
+        if any(kw in name.lower() for kw in ['link', 'atc', 'qt', 'checkout', 'offer id']): continue  
+        if "n/a" in val.lower(): continue
+        if val in seen_values: continue
+        seen_values.add(val)
+        
+        name_lower = name.lower()
+        if "price" in name_lower: icon = "💰"
+        elif "resell" in name_lower or "profit" in name_lower: icon = "📈"
+        elif "type" in name_lower: icon = "🔖"
+        elif "stock" in name_lower: icon = "✅"
+        elif "product info" in name_lower: icon = "ℹ️"
+        else: icon = "•"
+        
+        if "price" in name_lower:
+            # Add £ if no currency symbol
+            if not any(c in val for c in ['£', '$', '€']):
+                val = f"£{val}"
+            lines.append(f"{icon} <b>{name}:</b> <b>{val}</b>")
+        else:
+            lines.append(f"{icon} <b>{name}:</b> {val}")
+        
+    lines.append("")
+    
+    return lines, []
+
 def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[InlineKeyboardMarkup]]:
     """
-    PROFESSIONAL formatter - converts Discord embed to rich Telegram message.
-    
-    Returns:
-        (text, image_urls, keyboard)
+    Dispatcher for channel-specific formatting with Fallback to Generic.
     """
     raw = msg_data.get("raw_data", {})
     embed = raw.get("embed")
-    author = raw.get("author", {})
+    # author = raw.get("author", {}) # Unused
     plain_content = msg_data.get("content", "")
+    channel_id = str(msg_data.get("channel_id", ""))
     
-    # Parse the tag line for extra info
+    # Parse tag info just in case
     tag_info = parse_tag_line(plain_content) if plain_content else {}
     
     lines = []
+    custom_buttons = []
     
-    # === HEADER SECTION ===
-    
-    # Author name with bot badge
-    author_name = clean_text(author.get("name", "Unknown"))
-    if author.get("is_bot"):
-        lines.append(f"🤖 <b>{author_name}</b>")
-    else:
-        lines.append(f"👤 <b>{author_name}</b>")
-    
-    lines.append("")
-    
-    # === EMBED CONTENT ===
-    
+    # === DISPATCHER ===
     if embed:
-        # RETAILER/SOURCE (from embed author or tag)
-        retailer = None
-        if embed.get("author"):
-            retailer = clean_text(embed["author"].get("name"))
-        elif tag_info.get("brand"):
-            retailer = clean_text(tag_info["brand"])
-        
-        if retailer:
-            lines.append(f"🏪 <b>{retailer}</b>")
+        if channel_id == CHANNEL_COLLECTORS:
+            l, b = _format_collectors_amazon(msg_data, embed)
+            lines.extend(l)
+            custom_buttons.extend(b)
+        elif channel_id == CHANNEL_ARGOS:
+            l, b = _format_argos(msg_data, embed)
+            lines.extend(l)
+            custom_buttons.extend(b)
+        elif channel_id == CHANNEL_RESTOCKS:
+            l, b = _format_restocks_currys(msg_data, embed)
+            lines.extend(l)
+            custom_buttons.extend(b)
+        else:
+            # === FALLBACK/GENERIC FORMATTER (Original Logic Refined) ===
+            # RETAILER/SOURCE
+            retailer = None
+            if embed.get("author"):
+                retailer = clean_text(embed["author"].get("name"))
+            elif tag_info.get("brand"):
+                retailer = clean_text(tag_info["brand"])
+            
+            if retailer and "unknown" not in retailer.lower():
+                lines.append(f"🏪 <b>{retailer}</b>")
+                lines.append("")
+            
+            # TITLE
+            title = clean_text(embed.get("title") or tag_info.get("product_code") or "Product Alert")
+            if tag_info.get("region"): title = f"[{tag_info['region']}] {title}"
+            
+            lines.append(f"📦 <b>{title}</b>")
+            lines.append("━━━━━━━━━━━━━━━")
+            lines.append("")
+            
+            # DESC
+            if embed.get("description"):
+                desc = clean_text(embed["description"])[:400]
+                if len(clean_text(embed["description"])) > 400: desc += "..."
+                lines.append(desc)
+                lines.append("")
+            
+            # FIELDS
+            seen_values = set()
+            if embed.get("fields"):
+                for field in embed["fields"]:
+                    name = clean_text(field.get("name", ""))
+                    value = clean_text(field.get("value", ""))
+                    
+                    if name and value and not any(kw in name.lower() for kw in ['link', 'atc', 'qt', 'checkout', 'offer id']):
+                        # Skip N/A values
+                        if "n/a" in value.lower(): continue
+
+                        if value in seen_values: continue
+                        seen_values.add(value)
+                        
+                        # Enhanced emoji mapping for comprehensive field coverage
+                        name_lower = name.lower()
+                        if "status" in name_lower or "stock" in name_lower or "in stock" in name_lower: 
+                            icon = "✅"
+                        elif "price" in name_lower or "cost" in name_lower: 
+                            icon = "💰"
+                        elif "type" in name_lower:
+                            icon = "🔖"
+                        elif "resell" in name_lower or "profit" in name_lower: 
+                            icon = "📈"
+                        elif "member" in name_lower: 
+                            icon = "👥"
+                        elif "store" in name_lower or "shop" in name_lower: 
+                            icon = "🏪"
+                        elif "size" in name_lower: 
+                            icon = "📏"
+                        elif "product" in name_lower: 
+                            icon = "📦"
+                        elif "region" in name_lower or "location" in name_lower:
+                            icon = "🌍"
+                        elif "quantity" in name_lower or "qty" in name_lower:
+                            icon = "🔢"
+                        else: 
+                            icon = "•"
+                        
+                        if "price" in name_lower:
+                            # Add £ if no currency symbol
+                            if not any(c in value for c in ['£', '$', '€']):
+                                value = f"£{value}"
+                            lines.append(f"{icon} <b>{name}:</b> <b>{value}</b>")
+                        else:
+                            lines.append(f"{icon} <b>{name}:</b> {value}")
             lines.append("")
         
-        # PRODUCT TITLE (prioritize embed title over tag)
-        title = clean_text(embed.get("title") or tag_info.get("product_code") or "Product Alert")
-        
-        # Add region if available
-        if tag_info.get("region"):
-            title = f"[{tag_info['region']}] {title}"
-        
-        lines.append(f"📦 <b>{title}</b>")
-        lines.append("━━━━━━━━━━━━━━━")
-        lines.append("")
-        
-        # DESCRIPTION (truncated for readability)
-        if embed.get("description"):
-            desc = clean_text(embed["description"])[:400]
-            if len(clean_text(embed["description"])) > 400:
-                desc += "..."
-            lines.append(desc)
-            lines.append("")
-        
-        # FIELDS (Status, Price, Stock info) - EXCLUDE LINK FIELDS and DUPLICATES
-        seen_values = set()  # Track what we've already shown
-        if embed.get("fields"):
-            for field in embed["fields"]:
-                name = clean_text(field.get("name", ""))
-                value = clean_text(field.get("value", ""))
-                
-                # Skip link-related fields - these go to buttons
-                # Skip duplicates and empty values
-                if name and value and not any(kw in name.lower() for kw in ['link', 'atc', 'qt']):
-                    # Skip if we've already shown this exact value
-                    if value in seen_values:
-                        continue
-                    seen_values.add(value)
-                    
-                    # Smart emoji mapping
-                    if "status" in name.lower() or "stock" in name.lower():
-                        icon = "✅"
-                    elif "price" in name.lower() or "cost" in name.lower():
-                        icon = "💰"
-                    elif "resell" in name.lower():
-                        icon = "📈"
-                    elif "member" in name.lower():
-                        icon = "👥"
-                    elif "store" in name.lower() or "shop" in name.lower():
-                        icon = "🏪"
-                    elif "size" in name.lower():
-                        icon = "📏"
-                    elif "product" in name.lower():
-                        icon = "📦"
-                    else:
-                        icon = "•"
-                    
-                    # Format value for better readability (bold for prices and stock)
-                    if "price" in name.lower():
-                        lines.append(f"{icon} <b>{name}:</b> <b>{value}</b>")
-                    else:
-                        lines.append(f"{icon} <b>{name}:</b> {value}")
-        
-        lines.append("")
-        
-        # FOOTER (timestamp) - REMOVE IF CONTAINS CCN/MONITOR INFO
+        # FOOTER (Common)
         footer = embed.get("footer")
         if footer and "ccn" not in footer.lower() and "monitor" not in footer.lower():
             lines.append(f"⏰ {footer}")
         else:
-            # Use scraped_at only if footer is empty/monitor-related
             scraped_time = parse_iso_datetime(msg_data.get("scraped_at", datetime.utcnow().isoformat()))
             lines.append(f"⏰ {scraped_time.strftime('%H:%M UTC')}")
-    
+            
     else:
-        # FALLBACK: No embed, use plain content
+        # HUMAN MESSAGE FALLBACK (Refined)
         if plain_content:
-            # Show parsed tag info nicely
-            if tag_info.get("product_code"):
-                lines.append(f"📦 <b>{clean_text(tag_info['product_code'])}</b>")
-            if tag_info.get("brand"):
-                lines.append(f"🏪 {clean_text(tag_info['brand'])}")
-            if tag_info.get("action"):
-                lines.append(f"ℹ️ {clean_text(tag_info['action'])}")
+            # Don't show generic title if content is short/simple
+            if tag_info.get("product_code"): lines.append(f"📦 <b>{clean_text(tag_info['product_code'])}</b>")
             
-            lines.append("")
-            lines.append(clean_text(plain_content)[:800])
-            
+            # Clean up content
+            content_display = clean_text(plain_content)
+            # If content starts with "Restocks |", bold it or make it a header
+            if content_display.lower().startswith("restocks |"):
+                parts = content_display.split("|")
+                if len(parts) > 1:
+                    header = parts[0].strip()
+                    body = " | ".join(parts[1:]).strip()
+                    lines.append(f"⚡ <b>{header}</b>")
+                    lines.append("")
+                    lines.append(body)
+                else:
+                    lines.append(content_display)
+            else:
+                 lines.append(content_display[:800])
+
             scraped_time = parse_iso_datetime(msg_data.get("scraped_at", datetime.utcnow().isoformat()))
             lines.append("")
             lines.append(f"⏰ {scraped_time.strftime('%H:%M:%S UTC')}")
@@ -516,22 +705,16 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
     # === IMAGE EXTRACTION ===
     images = []
     if embed:
-        # Prioritize main images over thumbnail
-        if embed.get("images"):
-            images.extend(embed["images"][:3])  # Max 3 images
-        elif embed.get("thumbnail"):
-            images.append(embed["thumbnail"])
+        if embed.get("images"): images.extend(embed["images"][:3])
+        elif embed.get("thumbnail"): images.append(embed["thumbnail"])
     
-    # === BUTTON CREATION (CRITICAL FOR RESELLER LINKS) ===
+    # === BUTTON CREATION (GENERIC + CUSTOM) ===
     keyboard = []
     
+    # Logic for button creation same as before (extracting from fields/links)
     if embed and embed.get("links"):
         all_links = embed["links"]
-        
-        # Track URLs we've already added (deduplicate by URL)
         seen_urls = set()
-        
-        # Organize links by priority and field
         ebay_links = []
         fba_links = []
         atc_links = []
@@ -544,15 +727,9 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
             link_text = link.get('text', 'Link')
             field = link.get('field', '').lower()
             
-            # Skip empty URLs and invalid URLs
-            if not url or not url.startswith('http'):
-                continue
+            if not url or not url.startswith('http'): continue
+            if url in seen_urls: continue
             
-            # Skip if we've already added this exact URL
-            if url in seen_urls:
-                continue
-            
-            # Categorize by field first
             if 'atc' in field or 'qt' in field:
                 atc_links.append({'text': link_text, 'url': url, 'field': field})
                 seen_urls.add(url)
@@ -585,7 +762,7 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
                     other_links.append({'text': link_text, 'url': url})
                     seen_urls.add(url)
         
-        # Row 1: Price Checking (eBay links - Sold, Active, etc.)
+        # Row 1: Price Checking (eBay links)
         if ebay_links:
             row = []
             for link in ebay_links[:3]:
@@ -595,7 +772,7 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
             if row:
                 keyboard.append(row)
         
-        # Row 2: FBA/Analysis (Keepa, Amazon, etc.)
+        # Row 2: FBA/Analysis
         if fba_links:
             row = []
             for link in fba_links[:3]:
@@ -617,13 +794,13 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
         # Row 4: ATC (Add To Cart) Options
         if atc_links:
             row = []
-            for link in atc_links[:5]:  # Show up to 5 ATC options
+            for link in atc_links[:5]:
                 # Extract quantity from text if possible
                 qty_match = re.search(r'\d+', link['text'])
                 qty = qty_match.group(0) if qty_match else link['text']
                 btn_text = f"🛒 {qty}"
                 row.append(InlineKeyboardButton(btn_text, url=link['url']))
-                if len(row) == 3:  # 3 per row for ATC
+                if len(row) == 3:
                     keyboard.append(row)
                     row = []
             if row:
@@ -638,6 +815,10 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
             if row:
                 keyboard.append(row)
     
+    # Add custom buttons if any
+    if custom_buttons:
+        keyboard.extend(custom_buttons)
+    
     return text, images, InlineKeyboardMarkup(keyboard) if keyboard else None
 
 
@@ -647,28 +828,41 @@ def is_duplicate_source(msg_data: Dict) -> bool:
     These are filtered out to avoid duplicate alerts.
     """
     raw = msg_data.get("raw_data", {})
-    embed = raw.get("embed", {})
+    embed = raw.get("embed") or {}
     plain_content = msg_data.get("content", "")
     
     # Check author name
-    author_name = (raw.get("author", {}).get("name") or "").lower()
-    if "profitable pinger" in author_name:
+    author_name = (raw.get("author", {}) or {}).get("name", "")
+    if author_name and "profitable pinger" in author_name.lower():
         return True
     
-    # Check embed author
-    embed_author = (embed.get("author", {}) or {}).get("name") or ""
-    if "profitable pinger" in embed_author.lower():
-        return True
+    # Check embed author (only if embed exists)
+    if embed:
+        embed_author = (embed.get("author") or {}).get("name", "")
+        if embed_author and "profitable pinger" in embed_author.lower():
+            return True
+        
+        # Check footer (bot signature)
+        footer = embed.get("footer", "")
+        if footer and "profitable pinger" in footer.lower():
+            return True
     
-    # Check footer (bot signature)
-    footer = (embed.get("footer") or "").lower()
-    if "profitable pinger" in footer:
-        return True
-    
-    # Check plain content
-    if "profitable pinger" in plain_content.lower():
-        return True
-    
+    # Check all fields in embed
+    if embed and embed.get("fields"):
+        for field in embed["fields"]:
+            val = (field.get("value") or "").lower()
+            name = (field.get("name") or "").lower()
+            if "profitable pinger" in val or "profitable pinger" in name:
+                return True
+                
+    # Check title and description
+    if embed:
+        title = (embed.get("title") or "").lower()
+        desc = (embed.get("description") or "").lower()
+        if "profitable pinger" in title or "profitable pinger" in desc:
+            return True
+
+
     return False
 
 
@@ -693,6 +887,88 @@ def create_menu_with_back(buttons: List[List[InlineKeyboardButton]], back_to: st
 
 # --- COMMAND HANDLERS ---
 
+async def test_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Test command to replay recent N messages.
+    Usage: /test [N] (default 1)
+    """
+    user_id = str(update.effective_user.id)
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+
+    try:
+        count = 1
+        if context.args:
+            count = int(context.args[0])
+            count = min(max(count, 1), 10)  # Clamp between 1 and 10
+    except ValueError:
+        await update.message.reply_text("usage: /test [number]")
+        return
+
+    await update.message.reply_text(f"🔍 Fetching last {count} messages...")
+    
+    # Fetch from Supabase directly
+    try:
+        headers = {"apikey": poller.supabase_key, "Authorization": f"Bearer {poller.supabase_key}"}
+        url = f"{poller.supabase_url}/rest/v1/discord_messages"
+        params = {
+            "select": "*",
+            "order": "scraped_at.desc",
+            "limit": count
+        }
+        
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+        if res.status_code != 200:
+            await update.message.reply_text(f"❌ API Error: {res.status_code}")
+            return
+            
+        messages = res.json()
+        if not messages:
+            await update.message.reply_text("⚠️ No messages found in DB.")
+            return
+
+        # Reverse to show oldest first behavior? 
+        # Actually usually nice to see latest, but broadcasting sends older first.
+        # Let's send in the order fetched (descending) or reverse for chronological replay.
+        # Let's do reverse to mimic "stream"
+        messages.reverse() 
+        
+        for msg in messages:
+            text, images, keyboard = format_telegram_message(msg)
+            
+            # Send (Admin only)
+            if images:
+                try:
+                   await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=images[0],
+                        caption=text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard
+                    )
+                except Exception as e:
+                     await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"Image failed: {text}",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=keyboard
+                    )
+            else:
+                 await context.bot.send_message(
+                    chat_id=user_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard
+                )
+            await asyncio.sleep(0.5)
+
+        await update.message.reply_text("✅ Test complete.")
+
+    except Exception as e:
+        logger.error(f"Test error: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Welcome message with main menu"""
     user_id = str(update.effective_user.id)
@@ -706,7 +982,7 @@ Hello {username}! Get instant product alerts with all the data you need.
 <b>🎯 Features:</b>
 • ⚡ Real-time notifications
 • 🖼️ Product images
-• 🔗 Direct action links (eBay, Keepa, Amazon, etc.)
+• 🔗 Direct action links
 • 📊 Full stock & price data
 • ⏸️ Pause/Resume anytime
 
@@ -726,7 +1002,6 @@ Hello {username}! Get instant product alerts with all the data you need.
         parse_mode=ParseMode.HTML,
         reply_markup=create_main_menu()
     )
-
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard button presses with back navigation"""
@@ -867,135 +1142,214 @@ async def gen_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("Usage: /gen <days>")
 
-
 async def broadcast_job(context: ContextTypes.DEFAULT_TYPE):
-    """Poll for new messages and broadcast with PROFESSIONAL formatting"""
+    """
+    Poll for new messages and broadcast with timeout protection.
+    Uses async lock to prevent overlap and timeout to prevent hanging.
+    """
+    global job_start_time
+    
+    # Check if lock is already acquired (job still running)
+    if broadcast_lock.locked():
+        logger.warning("⚠️  Previous broadcast job still running - SKIPPING this cycle")
+        if job_start_time:
+            elapsed = (datetime.utcnow() - job_start_time).total_seconds()
+            logger.warning(f"   Job has been running for {elapsed:.1f}s")
+        return
+    
+    # Acquire lock
+    async with broadcast_lock:
+        job_start_time = datetime.utcnow()
+        logger.info(f"🔄 Broadcast job started at {job_start_time.strftime('%H:%M:%S')}")
+        
+        try:
+            # Wrap the entire job in a timeout
+            await asyncio.wait_for(
+                _broadcast_job_inner(context),
+                timeout=MAX_JOB_RUNTIME
+            )
+            
+            elapsed = (datetime.utcnow() - job_start_time).total_seconds()
+            logger.info(f"✅ Broadcast job completed in {elapsed:.1f}s")
+            
+        except asyncio.TimeoutError:
+            elapsed = (datetime.utcnow() - job_start_time).total_seconds()
+            logger.error(f"❌ Broadcast job TIMEOUT after {elapsed:.1f}s - forcing termination")
+            
+        except Exception as e:
+            elapsed = (datetime.utcnow() - job_start_time).total_seconds()
+            logger.error(f"❌ Broadcast job error after {elapsed:.1f}s: {type(e).__name__}: {e}")
+            logger.error(f"   Full traceback: {traceback.format_exc()}")
+        
+        finally:
+            job_start_time = None
+
+
+async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
+    """Inner broadcast logic - separated for timeout handling"""
+    
+    # Poll for new messages
     try:
         new_msgs = poller.poll_new_messages()
-        
-        if not new_msgs:
-            logger.debug("📭 Poll: No new messages found")
-            return
-        
-        # Filter out duplicate sources (Profitable Pinger, etc.)
-        filtered_msgs = [msg for msg in new_msgs if not is_duplicate_source(msg)]
-        
-        if len(filtered_msgs) < len(new_msgs):
-            skipped_count = len(new_msgs) - len(filtered_msgs)
-            logger.info(f"📬 Poll: Found {len(new_msgs)} message(s), skipped {skipped_count} duplicate source(s)")
-        else:
-            logger.info(f"📬 Poll: Found {len(new_msgs)} new message(s)")
-        
-        if not filtered_msgs:
-            logger.debug("📭 No messages after filtering duplicates")
-            return
-        
-        active_users = sm.get_active_users()
-        all_users = sm.users
-        
-        if not active_users:
-            logger.warning(f"⚠️  BROADCAST BLOCKED: No active users!")
-            logger.warning(f"   Total users: {len(all_users)}")
-            logger.warning(f"   New messages waiting: {len(filtered_msgs)}")
+    except Exception as e:
+        logger.error(f"❌ Failed to poll messages: {e}")
+        return
+    
+    if not new_msgs:
+        logger.debug("🔭 Poll: No new messages found")
+        return
+    
+    # Filter out duplicate sources
+    filtered_msgs = [msg for msg in new_msgs if not is_duplicate_source(msg)]
+    
+    if len(filtered_msgs) < len(new_msgs):
+        skipped_count = len(new_msgs) - len(filtered_msgs)
+        logger.info(f"📬 Poll: Found {len(new_msgs)} message(s), skipped {skipped_count} duplicate source(s)")
+    else:
+        logger.info(f"📬 Poll: Found {len(new_msgs)} new message(s)")
+    
+    if not filtered_msgs:
+        logger.debug("🔭 No messages after filtering duplicates")
+        return
+    
+    # Get active users
+    active_users = sm.get_active_users()
+    
+    if not active_users:
+        logger.warning(f"⚠️  BROADCAST BLOCKED: No active users!")
+        logger.warning(f"   Total users: {len(sm.users)}")
+        logger.warning(f"   New messages waiting: {len(filtered_msgs)}")
+        return
+    
+    logger.info(f"📤 BROADCAST: {len(filtered_msgs)} message(s) → {len(active_users)} active user(s)")
+    
+    # Process messages with batching
+    for msg_idx, msg in enumerate(filtered_msgs):
+        try:
+            logger.debug(f"   🔨 Formatting message {msg_idx + 1}/{len(filtered_msgs)}...")
+            text, images, keyboard = format_telegram_message(msg)
+            logger.debug(f"   ✓ Formatted (text={len(text)} chars, images={len(images) if images else 0})")
             
-            # Show why users are inactive
-            for uid, user_data in all_users.items():
-                paused = user_data.get("alerts_paused", False)
-                expiry = user_data.get("expiry", "unknown")
-                if paused:
-                    logger.warning(f"   • {uid}: PAUSED (expires {expiry})")
-                else:
-                    try:
-                        exp_dt = parse_iso_datetime(expiry)
-                        now = datetime.utcnow()
-                        if exp_dt <= now:
-                            logger.warning(f"   • {uid}: EXPIRED ({expiry})")
-                    except:
-                        logger.warning(f"   • {uid}: unknown status")
-            return
+            # Validate message is not empty
+            if not text or len(text.strip()) == 0:
+                logger.error(f"   ❌ Message {msg_idx + 1} produced empty text - SKIPPING")
+                logger.error(f"      Channel ID: {msg.get('channel_id')}")
+                logger.error(f"      Has embed: {bool(msg.get('raw_data', {}).get('embed'))}")
+                logger.error(f"      Content: {msg.get('content', '')[:100]}")
+                continue
+            
+        except Exception as e:
+            logger.error(f"   ❌ Failed to format message {msg_idx + 1}: {type(e).__name__}: {e}")
+            continue
         
-        logger.info(f"📤 BROADCAST: {len(filtered_msgs)} message(s) → {len(active_users)} active user(s)")
+        # Send to all active users with rate limiting
+        sent_count = 0
+        failed_count = 0
         
-        for msg_idx, msg in enumerate(filtered_msgs):
+        for uid in active_users:
             try:
-                logger.debug(f"   📝 Formatting message {msg_idx + 1}/{len(filtered_msgs)}...")
-                text, images, keyboard = format_telegram_message(msg)
-                logger.debug(f"   ✓ Message formatted successfully (text={len(text)} chars, images={len(images) if images else 0}, buttons={len(keyboard.inline_keyboard) if keyboard else 0})")
-                
-            except Exception as e:
-                logger.error(f"   ❌ Failed to format message {msg_idx + 1}: {type(e).__name__}: {e}")
-                logger.debug(f"   Message data: {json.dumps(msg, indent=2, default=str)[:500]}")
-                logger.error(f"   Full traceback: {traceback.format_exc()}")
-                continue  # Skip this message and move to next
-            
-            for uid in active_users:
-                try:
-                    # PROFESSIONAL DELIVERY: Image + Caption + Buttons
-                    if images:
-                        try:
-                            logger.debug(f"   📸 Sending photo alert to {uid}...")
-                            # Send first image with formatted caption and buttons
-                            await context.bot.send_photo(
+                # Send with timeout protection
+                if images:
+                    try:
+                        await asyncio.wait_for(
+                            context.bot.send_photo(
                                 chat_id=uid,
                                 photo=images[0],
-                                caption=text[:1024],  # Telegram limit
+                                caption=text[:1024],
                                 parse_mode=ParseMode.HTML,
                                 reply_markup=keyboard
+                            ),
+                            timeout=10.0
+                        )
+                        
+                        # Send additional images if multiple
+                        if len(images) > 1:
+                            media_group = [InputMediaPhoto(img) for img in images[1:3]]
+                            await asyncio.wait_for(
+                                context.bot.send_media_group(chat_id=uid, media=media_group),
+                                timeout=10.0
                             )
-                            
-                            # Send additional images if multiple
-                            if len(images) > 1:
-                                media_group = [InputMediaPhoto(img) for img in images[1:3]]
-                                await context.bot.send_media_group(chat_id=uid, media=media_group)
-                            logger.debug(f"   ✅ Photo alert sent to {uid}")
-                        except Exception as photo_error:
-                            logger.error(f"   ❌ Photo send failed for {uid}: {type(photo_error).__name__}: {photo_error}")
-                            # Fallback to text-only
-                            try:
-                                logger.debug(f"   📝 Falling back to text-only for {uid}...")
-                                await context.bot.send_message(
+                        sent_count += 1
+                        
+                    except asyncio.TimeoutError:
+                        logger.warning(f"   ⏱️  {uid}: Photo send timeout")
+                        # Fallback to text
+                        await asyncio.wait_for(
+                            context.bot.send_message(
+                                chat_id=uid,
+                                text=text,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=keyboard,
+                                disable_web_page_preview=False
+                            ),
+                            timeout=10.0
+                        )
+                        sent_count += 1
+                        
+                    except Exception as photo_error:
+                        logger.error(f"   ❌ {uid}: Photo failed - {type(photo_error).__name__}")
+                        # Fallback to text
+                        try:
+                            await asyncio.wait_for(
+                                context.bot.send_message(
                                     chat_id=uid,
                                     text=text,
                                     parse_mode=ParseMode.HTML,
                                     reply_markup=keyboard,
                                     disable_web_page_preview=False
-                                )
-                                logger.debug(f"   ✅ Text-only alert sent to {uid}")
-                            except Exception as fallback_error:
-                                raise fallback_error
-                    else:
-                        logger.debug(f"   📝 Sending text alert to {uid}...")
-                        # Text-only with buttons
-                        await context.bot.send_message(
+                                ),
+                                timeout=10.0
+                            )
+                            sent_count += 1
+                        except:
+                            failed_count += 1
+                else:
+                    # Text-only
+                    await asyncio.wait_for(
+                        context.bot.send_message(
                             chat_id=uid,
                             text=text,
                             parse_mode=ParseMode.HTML,
                             reply_markup=keyboard,
                             disable_web_page_preview=False
-                        )
-                        logger.debug(f"   ✅ Text alert sent to {uid}")
+                        ),
+                        timeout=10.0
+                    )
+                    sent_count += 1
+            
+            except asyncio.TimeoutError:
+                logger.warning(f"   ⏱️  {uid}: Message send timeout")
+                failed_count += 1
                 
-                except Exception as e:
-                    error_str = str(e)
-                    if "user not found" in error_str.lower() or "chat_id_invalid" in error_str.lower():
-                        logger.warning(f"   ⛔ {uid}: User invalid/blocked - deactivating subscription")
-                        # Optionally deactivate the user here
-                    elif "bot was blocked" in error_str.lower():
-                        logger.warning(f"   🚫 {uid}: Bot was blocked by user")
-                    elif "bad request" in error_str.lower():
-                        logger.error(f"   ⚠️  {uid}: Bad request (likely formatting issue): {error_str[:100]}")
-                    else:
-                        logger.error(f"   ❌ {uid}: {type(e).__name__}: {error_str[:200]}")
-                
-                # Rate limit protection
-                await asyncio.sleep(0.05)
-
+            except Exception as e:
+                error_str = str(e)
+                if "user not found" in error_str.lower() or "chat_id_invalid" in error_str.lower():
+                    logger.warning(f"   ⛔ {uid}: User invalid/blocked")
+                elif "bot was blocked" in error_str.lower():
+                    logger.warning(f"   🚫 {uid}: Bot blocked by user")
+                elif "badrequest" in error_str.lower():
+                    # Log full error for BadRequest to diagnose formatting issues
+                    logger.error(f"   ❌ {uid}: BadRequest - {error_str}")
+                    logger.error(f"      Message preview: {text[:200]}...")
+                else:
+                    logger.error(f"   ❌ {uid}: {type(e).__name__}: {error_str}")
+                failed_count += 1
+            
+            # Rate limit protection - small delay between users
+            await asyncio.sleep(0.05)
         
-    except Exception as e:
-        logger.error(f"❌ Broadcast job critical error: {type(e).__name__}: {e}")
-        logger.error(f"   Full traceback: {traceback.format_exc()}")
+        logger.info(f"   📊 Message {msg_idx + 1}: ✅ {sent_count} sent, ❌ {failed_count} failed")
+        
+        # Update cursor ONLY after successful processing of this message
+        # This ensures failed messages are retried on next poll
+        if sent_count > 0:  # At least one user received it
+            msg_scraped_at = msg.get("scraped_at")
+            if msg_scraped_at:
+                poller.update_cursor(msg_scraped_at)
+                logger.debug(f"   📌 Cursor updated to: {msg_scraped_at}")
 
 
+# 4. UPDATE run_bot() FUNCTION
 def run_bot():
     """Run bot with professional alert system"""
     try:
@@ -1009,19 +1363,24 @@ def run_bot():
         logger.info(f"   Token: {TELEGRAM_TOKEN[:15]}...***{TELEGRAM_TOKEN[-5:]}")
         logger.info(f"   Admin ID: {ADMIN_USER_ID}")
         logger.info(f"   Poll Interval: {POLL_INTERVAL} seconds")
-        logger.info(f"   Users file: {USERS_FILE}")
-        logger.info(f"   Codes file: {CODES_FILE}")
+        logger.info(f"   Max Runtime: {MAX_JOB_RUNTIME} seconds")
         
         app = Application.builder().token(TELEGRAM_TOKEN).build()
         
+        # Command Handlers
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("gen", gen_code))
+        app.add_handler(CommandHandler("test", test_alerts))  # New Test Command
         app.add_handler(CallbackQueryHandler(button_handler))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
         if app.job_queue:
-            logger.info("   Adding broadcast job...")
-            app.job_queue.run_repeating(broadcast_job, interval=POLL_INTERVAL, first=5)
+            logger.info("   Adding broadcast job with overlap protection...")
+            app.job_queue.run_repeating(
+                broadcast_job, 
+                interval=POLL_INTERVAL, 
+                first=10
+            )
             logger.info(f"   ✅ Job queue running (poll every {POLL_INTERVAL}s)")
         
         # Show active users count on startup
