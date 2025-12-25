@@ -1375,7 +1375,12 @@ To continue receiving real-time notifications with product images and direct lin
             sent += 1
             await asyncio.sleep(0.1)  # Small delay between users
         except Exception as e:
-            logger.error(f"Failed to send expiry reminder to {uid}: {e}")
+            err_str = str(e).lower()
+            if "chat not found" in err_str or "bot was blocked" in err_str or "user not found" in err_str:
+                logger.warning(f"⏩ Skipping unreachable user {uid} for 14 days ({e})")
+                sm.update_reminder_timestamp(uid)
+            else:
+                logger.error(f"Failed to send expiry reminder to {uid}: {e}")
             
     if sent > 0:
         logger.info(f"✅ Sent {sent} expiry reminder(s)")
