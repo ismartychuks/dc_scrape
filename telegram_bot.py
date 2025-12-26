@@ -23,6 +23,7 @@ USERS_FILE = "bot_users.json"
 CODES_FILE = "active_codes.json"
 POLL_INTERVAL = 120  # 2 minutes to prevent overlap
 MAX_JOB_RUNTIME = 110  # Maximum allowed runtime
+POTENTIAL_USERS_FILE = "potential_users.json"
 # JOB LOCK AND TIMEOUT
 broadcast_lock = asyncio.Lock()
 job_start_time = None
@@ -173,11 +174,14 @@ class SubscriptionManager:
     def __init__(self):
         self.users: Dict[str, Dict] = {} 
         self.codes: Dict[str, int] = {}
+        self.potential_users: Dict[str, Dict] = {}
         self.lock = threading.Lock()
         self.remote_users_path = f"discord_josh/{USERS_FILE}"
         self.remote_codes_path = f"discord_josh/{CODES_FILE}"
+        self.remote_potential_path = f"discord_josh/{POTENTIAL_USERS_FILE}"
         self.local_users_path = f"data/{USERS_FILE}"
         self.local_codes_path = f"data/{CODES_FILE}"
+        self.local_potential_path = f"data/{POTENTIAL_USERS_FILE}"
         os.makedirs("data", exist_ok=True)
         self._load_state()
 
@@ -218,12 +222,29 @@ class SubscriptionManager:
                     self.codes = json.load(f)
             except: pass
 
+        # Load Potential Users
+        potential_loaded = False
+        try:
+            data = supabase_utils.download_file(self.local_potential_path, self.remote_potential_path, SUPABASE_BUCKET)
+            if data:
+                self.potential_users = json.loads(data)
+                potential_loaded = True
+        except: pass
+
+        if not potential_loaded and os.path.exists(self.local_potential_path):
+            try:
+                with open(self.local_potential_path, 'r') as f:
+                    self.potential_users = json.load(f)
+            except: pass
+
     def _sync_state(self):
         try:
             with open(self.local_users_path, 'w') as f: json.dump(self.users, f)
             supabase_utils.upload_file(self.local_users_path, SUPABASE_BUCKET, self.remote_users_path, debug=False)
             with open(self.local_codes_path, 'w') as f: json.dump(self.codes, f)
             supabase_utils.upload_file(self.local_codes_path, SUPABASE_BUCKET, self.remote_codes_path, debug=False)
+            with open(self.local_potential_path, 'w') as f: json.dump(self.potential_users, f)
+            supabase_utils.upload_file(self.local_potential_path, SUPABASE_BUCKET, self.remote_potential_path, debug=False)
         except Exception as e:
             logger.error(f"Sync error: {e}")
 
@@ -253,6 +274,9 @@ class SubscriptionManager:
                 "alerts_paused": False,
                 "joined_at": self.users.get(str(user_id), {}).get("joined_at", datetime.utcnow().isoformat())
             }
+            # Remove from potential users if they were there
+            if str(user_id) in self.potential_users:
+                self.potential_users.pop(str(user_id))
             self._sync_state()
             return True
 
@@ -375,6 +399,45 @@ class SubscriptionManager:
                 self.users[uid]["last_expiry_reminder"] = datetime.utcnow().isoformat()
                 self._sync_state()
 
+    def track_potential_user(self, user_id: str, username: str):
+        """Track user who ran /start but isn't subscribed"""
+        with self.lock:
+            uid = str(user_id)
+            # Only add if not an active user and not already in potential list
+            if uid not in self.users and uid not in self.potential_users:
+                self.potential_users[uid] = {
+                    "username": username or "Unknown",
+                    "first_seen": datetime.utcnow().isoformat(),
+                    "last_reminder": None
+                }
+                self._sync_state()
+
+    def get_potential_users_needing_reminder(self) -> List[str]:
+        """Get potential users who haven't been reminded in 14 days"""
+        needing_reminder = []
+        now = datetime.utcnow()
+        with self.lock:
+            for uid, data in self.potential_users.items():
+                last_reminder_str = data.get("last_reminder")
+                if not last_reminder_str:
+                    # First reminder after 14 days of joining
+                    first_seen = parse_iso_datetime(data["first_seen"])
+                    if (now - first_seen).days >= 14:
+                        needing_reminder.append(uid)
+                else:
+                    last_reminder = parse_iso_datetime(last_reminder_str)
+                    if (now - last_reminder).days >= 14:
+                        needing_reminder.append(uid)
+        return needing_reminder
+
+    def update_potential_reminder_timestamp(self, user_id: str):
+        """Update last_reminder timestamp for potential user"""
+        with self.lock:
+            uid = str(user_id)
+            if uid in self.potential_users:
+                self.potential_users[uid]["last_reminder"] = datetime.utcnow().isoformat()
+                self._sync_state()
+
 
 # --- MESSAGE POLLER ---
 
@@ -382,6 +445,7 @@ class MessagePoller:
     def __init__(self):
         self.last_scraped_at = None
         self.sent_ids = set()
+        self.recent_signatures = []  # Last 3 sent content signatures
         self.supabase_url, self.supabase_key = supabase_utils.get_supabase_config()
         self.cursor_file = "bot_cursor.json"
         self.local_path = f"data/{self.cursor_file}"
@@ -396,6 +460,8 @@ class MessagePoller:
                 self.last_scraped_at = loaded.get("last_scraped_at")
                 # Support migration from sent_hashes to sent_ids
                 self.sent_ids = set(loaded.get("sent_ids", loaded.get("sent_hashes", [])))
+                # Load persistent signatures
+                self.recent_signatures = loaded.get("recent_signatures", [])
             if not self.last_scraped_at: 
                 self.last_scraped_at = (datetime.utcnow() - timedelta(hours=24)).isoformat()
         except:
@@ -406,10 +472,49 @@ class MessagePoller:
             with open(self.local_path, 'w') as f: 
                 json.dump({
                     "last_scraped_at": self.last_scraped_at,
-                    "sent_ids": list(self.sent_ids)[-1000:]
+                    "sent_ids": list(self.sent_ids)[-1000:],
+                    "recent_signatures": self.recent_signatures
                 }, f)
             supabase_utils.upload_file(self.local_path, SUPABASE_BUCKET, self.remote_path, debug=False)
         except: pass
+
+    def _get_content_signature(self, msg: Dict) -> str:
+        """Generate a signature for content-based deduplication (Retailer + Title + Price)"""
+        try:
+            raw = msg.get("raw_data", {})
+            embed = raw.get("embed") or {}
+            content = msg.get("content", "")
+            
+            # 1. Retailer
+            retailer = ""
+            if embed.get("author"):
+                retailer = embed["author"].get("name", "")
+            elif "Argos" in content:
+                retailer = "Argos Instore"
+            
+            # 2. Title
+            title = embed.get("title", "")
+            if not title and content:
+                # Try to extract from tag line
+                tag_info = parse_tag_line(content)
+                title = tag_info.get("product_code", "")
+            
+            # 3. Price
+            price = ""
+            fields = embed.get("fields", [])
+            for f in fields:
+                name = (f.get("name") or "").lower()
+                if "price" in name:
+                    price = f.get("value", "")
+                    break
+            
+            # Create raw signature and hash it
+            raw_sig = f"{retailer}|{title}|{price}".lower().strip()
+            import hashlib
+            return hashlib.md5(raw_sig.encode()).hexdigest()
+        except Exception as e:
+            logger.error(f"Error generating signature: {e}")
+            return str(msg.get("id"))
 
     def poll_new_messages(self):
         try:
@@ -425,24 +530,41 @@ class MessagePoller:
             
             messages = res.json()
             
-            # Filter duplicates by message ID (Discord ID)
+            # Filter duplicates by message ID AND Content Signature (Last 3)
             new_messages = []
             for msg in messages:
                 msg_id = msg.get("id")
-                if msg_id and msg_id not in self.sent_ids:
-                    new_messages.append(msg)
+                # 1. Discord ID Check (All-time)
+                if not msg_id or msg_id in self.sent_ids:
+                    continue
+                
+                # 2. Content Signature Check (Sliding Window)
+                sig = self._get_content_signature(msg)
+                if sig in self.recent_signatures:
+                    logger.info(f"⏭️ Skipping duplicate content: {msg_id} (Signature: {sig})")
+                    # Still add ID to sent_ids so we don't re-poll, but don't add to new_messages
                     self.sent_ids.add(msg_id)
-            
-            # DO NOT update cursor here - will be updated after successful broadcast
+                    continue
+
+                new_messages.append(msg)
+                self.sent_ids.add(msg_id)
             
             return new_messages
         except Exception as e:
             logger.error(f"Poll error: {e}")
             return []
     
-    def update_cursor(self, scraped_at: str):
-        """Update cursor to given scraped_at timestamp after successful processing"""
+    def update_cursor(self, scraped_at: str, msg_data: Optional[Dict] = None):
+        """Update cursor to given scraped_at timestamp and track recent signatures"""
         self.last_scraped_at = scraped_at
+        
+        if msg_data:
+            sig = self._get_content_signature(msg_data)
+            if sig not in self.recent_signatures:
+                self.recent_signatures.append(sig)
+                # Keep only last 3
+                self.recent_signatures = self.recent_signatures[-3:]
+                
         self._save_cursor()
 
 
@@ -1121,6 +1243,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     username = update.effective_user.username or update.effective_user.first_name
     
+    # Track as potential user if not subscribed
+    sm.track_potential_user(user_id, username)
+    
     welcome_text = f"""
 👋 <b>Welcome to KTTYDROPS!</b>
 
@@ -1412,6 +1537,55 @@ To continue receiving real-time notifications with product images and direct lin
     if sent > 0:
         logger.info(f"✅ Sent {sent} expiry reminder(s)")
 
+async def potential_user_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """Notify potential users who haven't subscribed once every two weeks"""
+    potential_uids = sm.get_potential_users_needing_reminder()
+    if not potential_uids:
+        return
+
+    logger.info(f"⏰ POTENTIAL USER REMINDERS: Sending to {len(potential_uids)} user(s)")
+    
+    reminder_text = """
+👋 <b>Ready to get started?</b>
+
+You recently checked out KTTYDROPS but haven't activated your subscription yet. 
+
+<b>Why subscribe?</b>
+• ⚡ <b>Instant Alerts:</b> Be the first to know about product drops.
+• 🖼️ <b>Full Data:</b> Images, stock levels, and prices included.
+• 🔗 <b>Quick Actions:</b> Direct links to eBay, Amazon, and more.
+
+🎟️ <b>How to get access:</b>
+1. Contact your administrator to get a subscription code.
+2. Use the <b>"🎟️ Redeem Code"</b> button in the main menu.
+3. Start receiving professional alerts immediately!
+
+<i>You will receive a reminder every two weeks.</i>
+"""
+    
+    sent = 0
+    for uid in potential_uids:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=reminder_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=create_main_menu()
+            )
+            sm.update_potential_reminder_timestamp(uid)
+            sent += 1
+            await asyncio.sleep(0.1)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "chat not found" in err_str or "bot was blocked" in err_str or "user not found" in err_str:
+                logger.warning(f"⏩ Skipping unreachable potential user {uid} for 14 days ({e})")
+                sm.update_potential_reminder_timestamp(uid)
+            else:
+                logger.error(f"Failed to send potential reminder to {uid}: {e}")
+            
+    if sent > 0:
+        logger.info(f"✅ Sent {sent} potential user reminder(s)")
+
 
 async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
     """Inner broadcast logic - separated for timeout handling"""
@@ -1576,7 +1750,7 @@ async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
         if sent_count > 0:  # At least one user received it
             msg_scraped_at = msg.get("scraped_at")
             if msg_scraped_at:
-                poller.update_cursor(msg_scraped_at)
+                poller.update_cursor(msg_scraped_at, msg)
                 logger.debug(f"   📌 Cursor updated to: {msg_scraped_at}")
 
 
@@ -1621,6 +1795,14 @@ def run_bot():
                 expiry_reminder_job,
                 interval=86400, # Once a day
                 first=30        # Start after 30 seconds
+            )
+
+            # Register potential user reminders (Check daily)
+            logger.info("   Adding bi-weekly potential user reminder job...")
+            app.job_queue.run_repeating(
+                potential_user_reminder_job,
+                interval=86400, # Once a day
+                first=60        # Start after 60 seconds
             )
             
             logger.info(f"   ✅ Job queue running (poll every {POLL_INTERVAL}s)")
