@@ -8,7 +8,7 @@ import asyncio
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import supabase_utils
@@ -1892,8 +1892,111 @@ async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
                 poller.update_cursor(msg_scraped_at, msg)
                 logger.debug(f"   📌 Cursor updated to: {msg_scraped_at}")
 
+# 4. COMMAND MENU SETUP
 
-# 4. UPDATE run_bot() FUNCTION
+# Default commands for all users
+DEFAULT_COMMANDS = [
+    BotCommand("start", "Start the bot and see main menu"),
+    BotCommand("menu", "Show available commands"),
+]
+
+# Additional commands for admins
+ADMIN_COMMANDS = [
+    BotCommand("start", "Start the bot and see main menu"),
+    BotCommand("menu", "Show available commands"),
+    BotCommand("gen", "Generate subscription code (e.g., /gen 30)"),
+    BotCommand("test", "Test recent alerts (e.g., /test 5)"),
+]
+
+# Additional commands for superadmin
+SUPERADMIN_COMMANDS = [
+    BotCommand("start", "Start the bot and see main menu"),
+    BotCommand("menu", "Show available commands"),
+    BotCommand("gen", "Generate subscription code (e.g., /gen 30)"),
+    BotCommand("test", "Test recent alerts (e.g., /test 5)"),
+    BotCommand("add_admin", "Add a user as admin (e.g., /add_admin 123456)"),
+    BotCommand("remove_admin", "Remove admin status (e.g., /remove_admin 123456)"),
+]
+
+async def setup_bot_commands(application: Application) -> None:
+    """Set up command menus for different user roles"""
+    try:
+        # Set default commands for all users
+        await application.bot.set_my_commands(DEFAULT_COMMANDS, scope=BotCommandScopeDefault())
+        logger.info("   ✅ Default command menu set")
+        
+        # Set admin commands for secondary admins
+        for user_id, user_data in sm.users.items():
+            if user_data.get("is_admin", False):
+                try:
+                    await application.bot.set_my_commands(
+                        ADMIN_COMMANDS, 
+                        scope=BotCommandScopeChat(chat_id=int(user_id))
+                    )
+                    logger.info(f"   ✅ Admin menu set for user {user_id}")
+                except Exception as e:
+                    logger.debug(f"   Could not set admin menu for {user_id}: {e}")
+        
+        # Set superadmin commands
+        if ADMIN_USER_ID:
+            try:
+                await application.bot.set_my_commands(
+                    SUPERADMIN_COMMANDS, 
+                    scope=BotCommandScopeChat(chat_id=int(ADMIN_USER_ID))
+                )
+                logger.info(f"   ✅ Superadmin menu set for {ADMIN_USER_ID}")
+            except Exception as e:
+                logger.debug(f"   Could not set superadmin menu: {e}")
+                
+    except Exception as e:
+        logger.error(f"   ❌ Failed to set command menus: {e}")
+
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show available commands based on user role"""
+    user_id = str(update.effective_user.id)
+    
+    # Build menu based on role
+    if is_superadmin(user_id):
+        menu_text = """
+🎛️ <b>Superadmin Commands</b>
+
+<b>General:</b>
+/start - Main menu & status
+/menu - Show this command list
+
+<b>Admin Tools:</b>
+/gen <days> - Generate subscription code
+/test <count> - Test recent alerts
+
+<b>User Management:</b>
+/add_admin <user_id> - Add an admin
+/remove_admin <user_id> - Remove an admin
+"""
+    elif is_admin(user_id):
+        menu_text = """
+🎛️ <b>Admin Commands</b>
+
+<b>General:</b>
+/start - Main menu & status
+/menu - Show this command list
+
+<b>Admin Tools:</b>
+/gen <days> - Generate subscription code
+/test <count> - Test recent alerts
+"""
+    else:
+        menu_text = """
+📋 <b>Available Commands</b>
+
+/start - Main menu & status
+/menu - Show this command list
+
+Use the menu buttons for more options!
+"""
+    
+    await update.message.reply_text(menu_text, parse_mode=ParseMode.HTML)
+
+# 5. RUN BOT FUNCTION
 def run_bot():
     """Run bot with professional alert system"""
     try:
@@ -1909,14 +2012,15 @@ def run_bot():
         logger.info(f"   Poll Interval: {POLL_INTERVAL} seconds")
         logger.info(f"   Max Runtime: {MAX_JOB_RUNTIME} seconds")
         
-        app = Application.builder().token(TELEGRAM_TOKEN).build()
+        app = Application.builder().token(TELEGRAM_TOKEN).post_init(setup_bot_commands).build()
         
         # Command Handlers
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("gen", gen_code))
         app.add_handler(CommandHandler("add_admin", add_bot_admin))
         app.add_handler(CommandHandler("remove_admin", remove_bot_admin))
-        app.add_handler(CommandHandler("test", test_alerts))  # New Test Command
+        app.add_handler(CommandHandler("test", test_alerts))
+        app.add_handler(CommandHandler("menu", show_menu))  # Menu command
         app.add_handler(CallbackQueryHandler(button_handler))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
