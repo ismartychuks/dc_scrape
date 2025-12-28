@@ -1386,13 +1386,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user_id = str(update.effective_user.id)
+    username = update.effective_user.username or update.effective_user.first_name or "User"
     action = query.data
     
     # Handle back button
     if action.startswith("back:"):
         menu_to_go = action.split(":", 1)[1]
         if menu_to_go == "main":
-            await query.edit_message_text("📋 <b>Main Menu</b>", parse_mode=ParseMode.HTML, reply_markup=create_main_menu())
+            # Show the same welcome content as /start
+            welcome_text = f"""
+👋 <b>Welcome to KTTYDROPS!</b>
+
+Hello {username}! Get instant product alerts with all the data you need.
+
+<b>🎯 Features:</b>
+• ⚡ Real-time notifications
+• 🖼️ Product images
+• 🔗 Direct action links
+• 📊 Full stock & price data
+• ⏸️ Pause/Resume anytime
+
+<b>📋 Status:</b>
+"""
+            if sm.is_active(user_id):
+                stats = sm.get_user_stats(user_id)
+                welcome_text += f"✅ <b>Active</b> - {stats['days_remaining']} days remaining\n"
+                if stats['is_paused']:
+                    welcome_text += "⏸️ Alerts currently paused\n"
+            else:
+                welcome_text += "❌ <b>Not subscribed</b>\n\nRedeem a code to get started!\n"
+            
+            await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML, reply_markup=create_main_menu())
         return
     
     if action == "status":
