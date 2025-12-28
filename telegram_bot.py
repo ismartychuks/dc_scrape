@@ -641,7 +641,8 @@ PHRASES_TO_REMOVE = [
     " Monitors v2.0.0 | CCN x Zephyr Monitors",
     "CCN 2.0 | Profitable Pinger",
     "@Unfiltered",
-    "CCN"
+    "CCN",
+    "@Product Flips"
 ]
 
 # Regex patterns to remove (for dynamic content like timestamps)
