@@ -5,7 +5,7 @@ requests
 supabase
 python-dotenv
 eventlet
-python-telegram-bot[job-queue]
+python-telegram-bot[job-queue]==21.1
 gunicorn
 nest_asyncio==1.5.8
 playwright==1.40.0

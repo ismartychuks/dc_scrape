@@ -8,6 +8,7 @@ import asyncio
 import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -28,6 +29,9 @@ POTENTIAL_USERS_FILE = "potential_users.json"
 # JOB LOCK AND TIMEOUT
 broadcast_lock = asyncio.Lock()
 job_start_time = None
+
+# Thread pool for blocking sync operations (image downloading, web scraping)
+sync_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="sync_io")
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -1008,7 +1012,7 @@ def _format_restocks_currys(msg_data: Dict, embed: Dict) -> Tuple[List[str], Lis
     
     return lines, []
 
-def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[InlineKeyboardMarkup], List[Tuple[str, bool]]]:
+def format_telegram_message(msg_data: Dict) -> Tuple[str, Optional[str], Optional[InlineKeyboardMarkup], bool]:
     """
     Dispatcher for channel-specific formatting with Fallback to Generic.
     """
@@ -1149,10 +1153,11 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
     text = "\n".join(lines)
     
     # === IMAGE EXTRACTION ===
-    images = []
-    images_to_download = []  # Track which images need download (from Discord, no compression)
+    # Get ONE image: try website first, fall back to Discord
+    image_url = None
+    is_discord_image = False
     
-    # Try to fetch high-quality images from product website first
+    # Try to fetch high-quality image from product website first
     product_url = None
     if embed and embed.get("links"):
         for link in embed["links"]:
@@ -1166,22 +1171,20 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
                     product_url = url
                     break
     
-    # Fetch images from product website
+    # Fetch image from product website (get only 1)
     if product_url:
-        website_images = fetch_product_images(product_url, max_images=3)
+        website_images = fetch_product_images(product_url, max_images=1)
         if website_images:
-            images.extend(website_images[:3])
+            image_url = website_images[0]
     
-    # Fallback to Discord embed images if no website images found
-    # Mark these for download to preserve original quality without compression
-    if not images and embed:
-        if embed.get("images"): 
-            discord_images = embed["images"][:3]
-            images.extend(discord_images)
-            images_to_download.extend([(img, True) for img in discord_images])
-        elif embed.get("thumbnail"): 
-            images.append(embed["thumbnail"])
-            images_to_download.append((embed["thumbnail"], True))
+    # Fallback to Discord embed image if no website image found
+    if not image_url and embed:
+        if embed.get("images"):
+            image_url = embed["images"][0]
+            is_discord_image = True
+        elif embed.get("thumbnail"):
+            image_url = embed["thumbnail"]
+            is_discord_image = True
     
     # === BUTTON CREATION (GENERIC + CUSTOM) ===
     keyboard = []
@@ -1294,7 +1297,7 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, List[str], Optional[In
     if custom_buttons:
         keyboard.extend(custom_buttons)
     
-    return text, images, InlineKeyboardMarkup(keyboard) if keyboard else None, images_to_download
+    return text, image_url, InlineKeyboardMarkup(keyboard) if keyboard else None, is_discord_image
 
 
 
@@ -1439,28 +1442,19 @@ async def test_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages.reverse() 
         
         for msg in messages:
-            text, images, keyboard, images_to_download = format_telegram_message(msg)
-            
-            # Limit to max 3 images
-            images = images[:3]
-            images_to_download = images_to_download[:3]
+            text, image_url, keyboard, is_discord_image = format_telegram_message(msg)
             
             # Send (Admin only)
-            if images:
+            if image_url:
                 try:
-                    # Check if this image needs download for quality preservation
-                    photo_data = images[0]
-                    is_discord_image = False
-                    
-                    # If image is marked for download (from Discord), get raw bytes
-                    # Discord images are sent as file uploads (bytes) to prevent Telegram compression
-                    for img_url, should_download in images_to_download:
-                        if should_download and img_url == images[0]:
-                            is_discord_image = True
-                            downloaded = download_image_without_compression(img_url)
-                            if downloaded:
-                                photo_data = downloaded
-                            break
+                    # If Discord image, download raw bytes to preserve quality
+                    photo_data = image_url
+                    if is_discord_image:
+                        # Run blocking sync operation in thread pool to avoid blocking event loop
+                        loop = asyncio.get_event_loop()
+                        downloaded = await loop.run_in_executor(sync_executor, download_image_without_compression, image_url)
+                        if downloaded:
+                            photo_data = downloaded
                     
                     await context.bot.send_photo(
                         chat_id=user_id,
@@ -1469,34 +1463,6 @@ async def test_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.HTML,
                         reply_markup=keyboard
                     )
-                    
-                    # Send additional images in same message group (max 3 total)
-                    if len(images) > 1:
-                        media_group = []
-                        for img in images[1:3]:
-                            # Check if this image needs to be downloaded (Discord images only)
-                            # Website images stay as URLs - Telegram won't compress them
-                            # Discord images are sent as raw bytes to prevent compression
-                            img_data = img
-                            is_discord = False
-                            
-                            for img_url, should_download in images_to_download:
-                                if should_download and img_url == img:
-                                    is_discord = True
-                                    downloaded = download_image_without_compression(img_url)
-                                    if downloaded:
-                                        img_data = downloaded
-                                    break
-                            
-                            # Send as either URL (website, no compression) or bytes (Discord, no compression)
-                            media_group.append(InputMediaPhoto(img_data))
-                        
-                        if media_group:
-                            try:
-                                await context.bot.send_media_group(chat_id=user_id, media=media_group)
-                            except:
-                                pass  # Skip if additional images fail
-                    
                 except Exception as e:
                      await context.bot.send_message(
                         chat_id=user_id,
@@ -1937,8 +1903,8 @@ async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
     for msg_idx, msg in enumerate(filtered_msgs):
         try:
             logger.debug(f"   🔨 Formatting message {msg_idx + 1}/{len(filtered_msgs)}...")
-            text, images, keyboard, images_to_download = format_telegram_message(msg)
-            logger.debug(f"   ✓ Formatted (text={len(text)} chars, images={len(images) if images else 0})")
+            text, image_url, keyboard, is_discord_image = format_telegram_message(msg)
+            logger.debug(f"   ✓ Formatted (text={len(text)} chars, image={'yes' if image_url else 'no'})")
             
             # Validate message is not empty
             if not text or len(text.strip()) == 0:
@@ -1959,21 +1925,16 @@ async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
         for uid in active_users:
             try:
                 # Send with timeout protection
-                if images:
+                if image_url:
                     try:
-                        # Check if this image needs download for quality preservation
-                        photo_data = images[0]
-                        is_discord_image = False
-                        
-                        # If image is marked for download (from Discord), get raw bytes
-                        # Discord images are sent as file uploads (bytes) to prevent Telegram compression
-                        for img_url, should_download in images_to_download:
-                            if should_download and img_url == images[0]:
-                                is_discord_image = True
-                                downloaded = download_image_without_compression(img_url)
-                                if downloaded:
-                                    photo_data = downloaded
-                                break
+                        # If Discord image, download raw bytes to preserve quality
+                        photo_data = image_url
+                        if is_discord_image:
+                            # Run blocking sync operation in thread pool to avoid blocking event loop
+                            loop = asyncio.get_event_loop()
+                            downloaded = await loop.run_in_executor(sync_executor, download_image_without_compression, image_url)
+                            if downloaded:
+                                photo_data = downloaded
                         
                         await asyncio.wait_for(
                             context.bot.send_photo(
@@ -1985,37 +1946,6 @@ async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
                             ),
                             timeout=10.0
                         )
-                        
-                        # Send additional images in same message group (max 3 total)
-                        if len(images) > 1:
-                            media_group = []
-                            for img in images[1:3]:
-                                # Check if this image needs to be downloaded (Discord images only)
-                                # Website images stay as URLs - Telegram won't compress them
-                                # Discord images are sent as raw bytes to prevent compression
-                                img_data = img
-                                is_discord = False
-                                
-                                for img_url, should_download in images_to_download:
-                                    if should_download and img_url == img:
-                                        is_discord = True
-                                        downloaded = download_image_without_compression(img_url)
-                                        if downloaded:
-                                            img_data = downloaded
-                                        break
-                                
-                                # Send as either URL (website, no compression) or bytes (Discord, no compression)
-                                media_group.append(InputMediaPhoto(img_data))
-                            
-                            if media_group:
-                                try:
-                                    await asyncio.wait_for(
-                                        context.bot.send_media_group(chat_id=uid, media=media_group),
-                                        timeout=10.0
-                                    )
-                                except:
-                                    pass  # Skip if additional images fail
-                        
                         sent_count += 1
                         
                     except asyncio.TimeoutError:
