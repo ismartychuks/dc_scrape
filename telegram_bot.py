@@ -1122,6 +1122,48 @@ def _format_restocks_currys(msg_data: Dict, embed: Dict) -> Tuple[List[str], Lis
     
     return lines, []
 
+def optimize_image_url(url: str) -> str:
+    """
+    Optimize image URLs to force high resolution.
+    Fixes Amazon _SL160_ thumbnails and eBay s-l300 thumbnails.
+    """
+    if not url: return url
+    
+    try:
+        # 1. Decode Discord Proxy URLs
+        # Example: .../external/HASH/https/m.media-amazon.com/...
+        if "images-ext-1.discordapp.net" in url or "images-ext-2.discordapp.net" in url:
+            # Try to extract the real URL from the path
+            # Pattern: /external/[hash]/[protocol]/[domain]/[path]
+            # Simple heuristic: find the recurrence of 'http'
+            if "/https/" in url:
+                url = "https://" + url.split("/https/", 1)[1]
+            elif "/http/" in url:
+                url = "http://" + url.split("/http/", 1)[1]
+                
+        # 2. Amazon Image Optimization
+        # Pattern: ._SL160_.jpg -> .jpg  (Removes size constraint)
+        if "media-amazon.com" in url or "ssl-images-amazon.com" in url:
+            # Remove size indicators: ._SL160_  ._AC_UY218_  etc.
+            # Regex look for ._XX###_.
+            url = re.sub(r'\._[A-Z_]+[0-9]+_\.', '.', url)
+            
+            # Remove query params like ?format=webp
+            if "?" in url:
+                url = url.split("?")[0]
+
+        # 3. eBay Image Optimization
+        # Pattern: s-l300.jpg -> s-l1600.jpg (Max resolution)
+        if "ebayimg.com" in url:
+            if re.search(r's-l\d+\.', url):
+                url = re.sub(r's-l\d+\.', 's-l1600.', url)
+                
+    except Exception as e:
+        logger.error(f"Image optimization error for {url}: {e}")
+        
+    return url
+
+
 def format_telegram_message(msg_data: Dict) -> Tuple[str, Optional[str], Optional[InlineKeyboardMarkup], bool]:
     """
     Dispatcher for channel-specific formatting with Fallback to Generic.
@@ -1263,71 +1305,22 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, Optional[str], Optiona
     text = "\n".join(lines)
     
     # === IMAGE EXTRACTION ===
-    # Get ONE image: try website first, fall back to Discord
+    # Get ONE image: Use the CDN image URL stored in the embed
     image_url = None
-    is_discord_image = False
+    is_discord_image = True  # Mark all as needing download to preserve quality
     
-    # Try to fetch high-quality image from product website first
-    product_url = None
-    
-    # First, check if embed has a URL (title link)
-    if embed and embed.get("url"):
-        product_url = embed.get("url")
-        logger.info(f"   📍 Found embed URL: {product_url[:80]}...")
-    
-    # Otherwise, check links array for product links
-    if not product_url and embed and embed.get("links"):
-        logger.info(f"   🔍 Checking {len(embed['links'])} links in embed...")
-        for link in embed["links"]:
-            link_text = link.get('text', '').lower()
-            url = link.get('url', '')
-            field = link.get('field', '').lower()
-            
-            # Skip tool/utility links (ATC, QT, Setup)
-            if any(kw in link_text for kw in ['setup', 'quicktask', 'atc', 'qt']):
-                logger.info(f"      ⏭️  Skipping tool link: {link_text}")
-                continue
-            
-            if not url or not url.startswith('http'):
-                continue
-            
-            logger.info(f"      🔗 Evaluating link: {link_text} -> {url[:60]}...")
-            
-            # Accept any link that points to a known retailer/marketplace
-            is_search_link = any(domain in url.lower() for domain in ['amazon.com', 'ebay.com', 'ebay.co.uk', 'stockx.com', 'snkrdunk.com', 'google.com', 'keepa.com', 'camel.com', 'selleramp'])
-            is_product_keyword = any(kw in link_text for kw in ['buy', 'shop', 'product', 'checkout', 'search', 'click here'])
-            is_major_retailer = any(domain in url.lower() for domain in ['amazon', 'ebay', 'stockx', 'snkrdunk', 'shopify', 'currys', 'argos', 'awd-it', 'collectorsedge', '.co.uk', '.com'])
-            
-            if is_search_link or is_product_keyword or is_major_retailer:
-                product_url = url
-                logger.info(f"   ✅ Selected URL for scraping: {url[:80]}...")
-                break
-            else:
-                logger.info(f"      ❌ Did not match criteria (search:{is_search_link}, keyword:{is_product_keyword}, retailer:{is_major_retailer})")
-    
-    # Fetch image from product website (get only 1)
-    if product_url:
-        try:
-            website_images = fetch_product_images(product_url, max_images=1)
-            if website_images and len(website_images) > 0:
-                image_url = website_images[0]
-                is_discord_image = False
-                logger.info(f"   ✅ Using website image: {image_url[:80]}...")
-            else:
-                logger.info(f"   ⚠️  No images found on website, falling back to Discord")
-        except Exception as e:
-            logger.info(f"   ⚠️  Website scraping failed: {e}")
-    
-    # Fallback to Discord embed image if no website image found
-    if not image_url and embed:
+    # Use the CDN image URL from the embed (stored in database)
+    # These are high-quality retailer URLs (Shopify, Amazon, etc.)
+    if embed:
         if embed.get("images"):
-            image_url = embed["images"][0]
-            is_discord_image = True
-            logger.info(f"   📸 Using Discord image (fallback)")
+            # Discord embed images contain the original CDN links from retailers
+            raw_url = embed["images"][0]
+            image_url = optimize_image_url(raw_url)
+            logger.info(f"   📸 Found image: {raw_url[:50]}... -> Optimized: {image_url[:50]}...")
         elif embed.get("thumbnail"):
-            image_url = embed["thumbnail"]
-            is_discord_image = True
-            logger.info(f"   📸 Using Discord thumbnail (fallback)")
+            raw_url = embed["thumbnail"]
+            image_url = optimize_image_url(raw_url)
+            logger.info(f"   📸 Found thumbnail: {raw_url[:50]}... -> Optimized: {image_url[:50]}...")
     
     # === BUTTON CREATION (GENERIC + CUSTOM) ===
     keyboard = []
@@ -1597,7 +1590,10 @@ async def test_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         loop = asyncio.get_event_loop()
                         downloaded = await loop.run_in_executor(sync_executor, download_image_without_compression, image_url)
                         if downloaded:
-                            photo_data = downloaded
+                            # Wrap bytes in BytesIO to preserve quality (no compression)
+                            from io import BytesIO
+                            photo_data = BytesIO(downloaded)
+                            logger.info(f"   ✅ Downloaded image as bytes ({len(downloaded)} bytes)")
                     
                     await context.bot.send_photo(
                         chat_id=user_id,
@@ -2077,7 +2073,9 @@ async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
                             loop = asyncio.get_event_loop()
                             downloaded = await loop.run_in_executor(sync_executor, download_image_without_compression, image_url)
                             if downloaded:
-                                photo_data = downloaded
+                                # Wrap bytes in BytesIO to preserve quality (no compression)
+                                from io import BytesIO
+                                photo_data = BytesIO(downloaded)
                         
                         await asyncio.wait_for(
                             context.bot.send_photo(
