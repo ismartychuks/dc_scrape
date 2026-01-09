@@ -1325,46 +1325,7 @@ def _format_restocks_currys(msg_data: Dict, embed: Dict) -> Tuple[List[str], Lis
     
     return lines, []
 
-def optimize_image_url(url: str) -> str:
-    """
-    Optimize image URLs to force high resolution.
-    Fixes Amazon _SL160_ thumbnails and eBay s-l300 thumbnails.
-    """
-    if not url: return url
-    
-    try:
-        # 1. Decode Discord Proxy URLs
-        # Example: .../external/HASH/https/m.media-amazon.com/...
-        if "images-ext-1.discordapp.net" in url or "images-ext-2.discordapp.net" in url:
-            # Try to extract the real URL from the path
-            # Pattern: /external/[hash]/[protocol]/[domain]/[path]
-            # Simple heuristic: find the recurrence of 'http'
-            if "/https/" in url:
-                url = "https://" + url.split("/https/", 1)[1]
-            elif "/http/" in url:
-                url = "http://" + url.split("/http/", 1)[1]
-                
-        # 2. Amazon Image Optimization
-        # Pattern: ._SL160_.jpg -> .jpg  (Removes size constraint)
-        if "media-amazon.com" in url or "ssl-images-amazon.com" in url:
-            # Remove size indicators: ._SL160_  ._AC_UY218_  etc.
-            # Regex look for ._XX###_.
-            url = re.sub(r'\._[A-Z_]+[0-9]+_\.', '.', url)
-            
-            # Remove query params like ?format=webp
-            if "?" in url:
-                url = url.split("?")[0]
-
-        # 3. eBay Image Optimization
-        # Pattern: s-l300.jpg -> s-l1600.jpg (Max resolution)
-        if "ebayimg.com" in url:
-            if re.search(r's-l\d+\.', url):
-                url = re.sub(r's-l\d+\.', 's-l1600.', url)
-                
-    except Exception as e:
-        logger.error(f"Image optimization error for {url}: {e}")
-        
-    return url
+# Utility functions consolidated at the top of the file
 
 
 def format_telegram_message(msg_data: Dict) -> Tuple[str, Optional[str], Optional[InlineKeyboardMarkup], bool]:
@@ -1564,85 +1525,67 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, Optional[str], Optiona
     # 4. Fallback -> Use Discord Image.
 
     image_url = None
-    is_discord_image = False
+    image_bytes = None
     
-    # 1. Get Candidate from Discord (Raw & Optimized)
-    discord_raw = None
-    discord_opt = None
+    # 1. Get Best Candidate from Discord
+    discord_candidate = None
     if embed:
         if embed.get("images"):
-            discord_raw = embed["images"][0]
-            discord_opt = optimize_image_url(discord_raw) # removes width/height params if possible
+            discord_candidate = optimize_image_url(embed["images"][0])
         elif embed.get("thumbnail"):
-            discord_raw = embed["thumbnail"]
-            discord_opt = optimize_image_url(discord_raw)
+            discord_candidate = optimize_image_url(embed["thumbnail"])
             
-    # 2. Check Resolution & Trust
-    use_discord_candidate = False
-    
-    if discord_opt:
-        # A. Trusted High-Res (Amazon/eBay) - ALWAYS USE
-        trusted_domains = ['amazon', 'ebay', 'media-amazon', 'ebayimg']
-        if any(d in discord_opt.lower() for d in trusted_domains):
-            use_discord_candidate = True
-            logger.info(f"   📸 Trusted High-Res Image (Skipping Scrape): {discord_opt[:60]}...")
-            
-        # B. Check Resolution from Raw Proxy URL (if not trusted yet)
-        if not use_discord_candidate and discord_raw:
-             # Look for width=XXX&height=YYY params in the raw discord proxy url
-             w_match = re.search(r'width=(\d+)', discord_raw)
-             h_match = re.search(r'height=(\d+)', discord_raw)
-             
-             if w_match and h_match:
-                 w = int(w_match.group(1))
-                 h = int(h_match.group(1))
-                 # Relaxed check: valid if EITHER dimension is large enough (e.g. 160x1600 is fine)
-                 if w >= 200 or h >= 200:
-                     use_discord_candidate = True
-                     logger.info(f"   📸 Discord Image is High-Res ({w}x{h}). Using it.")
-                 else:
-                     logger.info(f"   ⚠️ Discord Image is Low-Res ({w}x{h}). Will Scrape.")
-                     
-             elif not "discordapp.net" in discord_raw:
-                 # If it's NOT a proxy URL (it's a direct link), we assume it's good.
-                 use_discord_candidate = True
-                 logger.info(f"   📸 Direct CDN Image found. Using it.")
-             else:
-                 # If it's a proxy link but no width/height params are found,
-                 # we assume it's high-res to avoid getting blocked by scrapers.
-                 use_discord_candidate = True
-                 logger.info(f"   📸 Discord Proxy Image found without dimensions. Using it.")
+    # 2. Empirical Check: Download and Verify Pixels
+    if discord_candidate:
+        logger.info(f"   🔍 Verifying Discord candidate image: {discord_candidate[:60]}...")
+        # Note: download_image_high_quality uses Pillow internally to verify
+        downloaded = download_image_high_quality(discord_candidate)
+        
+        if downloaded:
+            try:
+                img = Image.open(BytesIO(downloaded))
+                width, height = img.size
+                
+                # Trust it if it's high res (>= 400px in either dimension)
+                # This covers long thin images or wide banners correctly
+                if width >= 400 or height >= 400:
+                    image_url = discord_candidate
+                    image_bytes = downloaded
+                    logger.info(f"   📸 ✅ Discord image is High-Res pixels ({width}x{height}). Skipping scrape.")
+                else:
+                    logger.info(f"   ⚠️ Discord image is Low-Res pixels ({width}x{height}).")
+            except Exception as e:
+                logger.warning(f"   ⚠️ Failed to verify Discord image pixels: {e}")
 
-    if use_discord_candidate:
-        image_url = discord_opt
-        is_discord_image = True # treat as verified
-        
-    else:
-        # 3. Attempt Scraping (For unknown sites or unverified resolution)
+    # 3. Attempt Scraping ONLY if we don't have a high-res candidate yet
+    if not image_url:
         target_scrape_url = None
-        
-        # Priority: Title > Buy > ATC > Other
         if title_links: target_scrape_url = title_links[0]['url']
         elif buy_links: target_scrape_url = buy_links[0]['url']
         elif atc_links: target_scrape_url = atc_links[0]['url']
         elif other_links: target_scrape_url = other_links[0]['url']
         
-        # Don't scrape generic pages
         if target_scrape_url:
             skip_scrape = any(x in target_scrape_url.lower() for x in ['keepa.com', 'ebay.com/sch', 'login', 'cart', 'checkout'])
             if not skip_scrape:
                 logger.info(f"   🔍 Attempting to scrape images from: {target_scrape_url[:60]}...")
                 scraped_images = fetch_product_images(target_scrape_url, max_images=1)
                 if scraped_images:
-                    image_url = scraped_images[0]
-                    is_discord_image = False
-                    logger.info(f"   📸 ✅ Using scraped website image: {image_url[:60]}...")
+                    scraped_url = scraped_images[0]
+                    # Verify scraped image quality as well
+                    logger.info(f"   🔍 Verifying scraped image: {scraped_url[:60]}...")
+                    downloaded_scraped = download_image_high_quality(scraped_url)
+                    if downloaded_scraped:
+                        image_url = scraped_url
+                        image_bytes = downloaded_scraped
+                        logger.info(f"   📸 ✅ Using verified scraped website image.")
 
-        # 4. Fallback to Discord Candidate
-        if not image_url and discord_opt:
-            image_url = discord_opt
-            is_discord_image = True
-            logger.info(f"   📸 Fallback to Discord image (Optimized): {image_url[:60]}...")
+    # 4. Final Fallback (If scraping failed or returned low res, use the best we found)
+    if not image_url and discord_candidate:
+        image_url = discord_candidate
+        # We might already have the bytes from step 2
+        # Use them if available, otherwise just use the URL
+        logger.info(f"   📸 Fallback to Discord image.")
     
     # === BUTTON CREATION ===
     keyboard = []
@@ -1703,7 +1646,7 @@ def format_telegram_message(msg_data: Dict) -> Tuple[str, Optional[str], Optiona
     if custom_buttons:
         keyboard.extend(custom_buttons)
     
-    return text, image_url, InlineKeyboardMarkup(keyboard) if keyboard else None, is_discord_image
+    return text, image_url, InlineKeyboardMarkup(keyboard) if keyboard else None, image_bytes
 
 
 
@@ -1848,19 +1791,22 @@ async def test_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages.reverse() 
         
         for msg in messages:
-            text, image_url, keyboard, is_discord_image = format_telegram_message(msg)
+            text, image_url, keyboard, image_bytes = format_telegram_message(msg)
             
             # Prepare photo data once
             photo_data = image_url
-            if image_url:
+            if image_bytes:
+                # Reuse pre-verified bytes from formatting step
+                photo_data = BytesIO(image_bytes)
+                logger.info(f"   ✅ Using pre-verified image bytes ({len(image_bytes)} bytes)")
+            elif image_url:
                 try:
-                    # Use Pillow (via download_image_high_quality) for ALL images to ensure quality and verification
+                    # Fallback for unexpected cases where we have URL but no bytes
                     loop = asyncio.get_event_loop()
                     downloaded = await loop.run_in_executor(sync_executor, download_image_high_quality, image_url)
                     if downloaded:
-                        # Wrap bytes in BytesIO to preserve quality
                         photo_data = BytesIO(downloaded)
-                        logger.info(f"   ✅ Processed image via Pillow ({len(downloaded)} bytes)")
+                        logger.info(f"   ✅ Processed image via Pillow fallback ({len(downloaded)} bytes)")
                 except Exception as e:
                     logger.warning(f"   ⚠️ Pillow processing failed, falling back to URL: {e}")
 
@@ -2317,15 +2263,11 @@ async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
     for msg_idx, msg in enumerate(filtered_msgs):
         try:
             logger.debug(f"   🔨 Formatting message {msg_idx + 1}/{len(filtered_msgs)}...")
-            text, image_url, keyboard, is_discord_image = format_telegram_message(msg)
+            text, image_url, keyboard, image_bytes = format_telegram_message(msg)
             logger.debug(f"   ✓ Formatted (text={len(text)} chars, image={'yes' if image_url else 'no'})")
             
             # Validate message is not empty
             if not text or len(text.strip()) == 0:
-                logger.error(f"   ❌ Message {msg_idx + 1} produced empty text - SKIPPING")
-                logger.error(f"      Channel ID: {msg.get('channel_id')}")
-                logger.error(f"      Has embed: {bool(msg.get('raw_data', {}).get('embed'))}")
-                logger.error(f"      Content: {msg.get('content', '')[:100]}")
                 continue
             
         except Exception as e:
@@ -2334,15 +2276,18 @@ async def _broadcast_job_inner(context: ContextTypes.DEFAULT_TYPE):
         
         # Prepare photo data once per message
         photo_data = image_url
-        if image_url:
+        if image_bytes:
+            # Reuse pre-verified bytes from formatting step
+            photo_data = image_bytes
+            logger.info(f"   ✅ Using pre-verified message image bytes ({len(image_bytes)} bytes)")
+        elif image_url:
             try:
-                # Use Pillow (via download_image_high_quality) for ALL images to ensure quality and verification
+                # Fallback for unexpected cases
                 loop = asyncio.get_event_loop()
                 downloaded = await loop.run_in_executor(sync_executor, download_image_high_quality, image_url)
                 if downloaded:
-                    # Store as raw bytes to easily seek(0) in the user loop
                     photo_data = downloaded
-                    logger.info(f"   ✅ Processed message image via Pillow ({len(downloaded)} bytes)")
+                    logger.info(f"   ✅ Processed message image via Pillow fallback ({len(downloaded)} bytes)")
             except Exception as e:
                 logger.warning(f"   ⚠️ Pillow processing failed: {e}")
 
