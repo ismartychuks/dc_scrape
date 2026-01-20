@@ -1854,7 +1854,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sm.track_potential_user(user_id, username)
     
     welcome_text = f"""
-👋 <b>Welcome to KTTYDROPS!</b>
+👋 <b>Welcome to Hollowscan!</b>
 
 Hello {username}! Get instant product alerts with all the data you need.
 
