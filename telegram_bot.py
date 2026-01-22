@@ -2842,7 +2842,7 @@ async def setup_bot_commands(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # --- BROADCAST FEATURE ---
 
-BROADCAST_TARGET, BROADCAST_MESSAGE, BROADCAST_CONFIRM = range(3)
+BROADCAST_TARGET, BROADCAST_MESSAGE, BROADCAST_PIN, BROADCAST_CONFIRM = range(4)
 
 async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the broadcast conversation"""
@@ -2914,38 +2914,102 @@ async def broadcast_message_input(update: Update, context: ContextTypes.DEFAULT_
             "text": caption
         }
         
-        # Send preview
-        keyboard = [
-            [InlineKeyboardButton("✅ Send Broadcast", callback_data="confirm_send")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-        ]
-        await message.reply_photo(
-            photo=file_id,
-            caption=f"📢 <b>PREVIEW (Target: {context.user_data['broadcast_target']})</b>\n\n{caption}\n\n-------------------\nClick confirm to send.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        
     elif message.text:
         text = message.text
         context.user_data["broadcast_content"] = {
             "type": "text",
             "text": text
         }
-        
-        # Send preview
-        keyboard = [
-            [InlineKeyboardButton("✅ Send Broadcast", callback_data="confirm_send")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
-        ]
-        await message.reply_text(
-            text=f"📢 <b>PREVIEW (Target: {context.user_data['broadcast_target']})</b>\n\n{text}\n\n-------------------\nClick confirm to send.",
+    else:
+        await message.reply_text("⚠️ Please send text or a photo.")
+        return BROADCAST_MESSAGE
+
+    # Ask for pinning preference
+    keyboard = [
+        [InlineKeyboardButton("✅ Pin (Notify)", callback_data="pin_notify")],
+        [InlineKeyboardButton("🔕 Pin (Silent)", callback_data="pin_silent")],
+        [InlineKeyboardButton("❌ Don't Pin", callback_data="pin_no")],
+        [InlineKeyboardButton("🚫 Cancel Broadcast", callback_data="cancel")]
+    ]
+    
+    # Replying with the pin question
+    if message.photo:
+        await message.reply_photo(
+            photo=context.user_data["broadcast_content"]["file_id"],
+            caption=f"📢 <b>PREVIEW (Target: {context.user_data['broadcast_target']})</b>\n\n{context.user_data['broadcast_content']['text']}\n\n-------------------\n📌 <b>Do you want to pin this message?</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     else:
-        await message.reply_text("⚠️ Please send text or a photo.")
-        return BROADCAST_MESSAGE
+        await message.reply_text(
+            text=f"📢 <b>PREVIEW (Target: {context.user_data['broadcast_target']})</b>\n\n{context.user_data['broadcast_content']['text']}\n\n-------------------\n📌 <b>Do you want to pin this message?</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+    return BROADCAST_PIN
+
+async def broadcast_pin_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the pinning choice and move to confirmation"""
+    query = update.callback_query
+    await query.answer()
+    
+    choice = query.data
+    if choice == "cancel":
+        await query.edit_message_text("❌ Broadcast cancelled.")
+        return ConversationHandler.END
+        
+    # Store pin preference
+    pin_mode = "no"
+    if choice == "pin_notify":
+        pin_mode = "notify"
+    elif choice == "pin_silent":
+        pin_mode = "silent"
+        
+    context.user_data["broadcast_pin"] = pin_mode
+    
+    # Now send final confirmation
+    target = context.user_data["broadcast_target"]
+    pin_text = {
+        "notify": "✅ Pin & Notify",
+        "silent": "🔕 Pin Silently",
+        "no": "❌ No Pin"
+    }.get(pin_mode)
+    
+    # Update the preview message to show confirmation button
+    keyboard = [
+        [InlineKeyboardButton("🚀 EXECUTE BROADCAST", callback_data="confirm_send")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+    ]
+    
+    confirm_text = (
+        f"📢 <b>FINAL CONFIRMATION</b>\n\n"
+        f"🎯 Target: <b>{target}</b>\n"
+        f"📌 Pinning: <b>{pin_text}</b>\n\n"
+        "Ready to send?"
+    )
+
+    try:
+        if query.message.photo:
+             await query.edit_message_caption(
+                 caption=confirm_text,
+                 reply_markup=InlineKeyboardMarkup(keyboard),
+                 parse_mode=ParseMode.HTML
+             )
+        else:
+             await query.edit_message_text(
+                 text=confirm_text,
+                 reply_markup=InlineKeyboardMarkup(keyboard),
+                 parse_mode=ParseMode.HTML
+             )
+    except Exception as e:
+        logger.warning(f"Error updating confirmation msg: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=confirm_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML
+        )
         
     return BROADCAST_CONFIRM
 
@@ -2960,6 +3024,7 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     target = context.user_data.get("broadcast_target")
     content = context.user_data.get("broadcast_content")
+    pin_mode = context.user_data.get("broadcast_pin", "no")
     
     # Get recipients
     recipients = []
@@ -2975,14 +3040,10 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if we are editing a text message or a caption (if photo)
     try:
         if update.callback_query.message.photo:
-            # If the preview was a photo, we can't use edit_message_text easily on the caption 
-            # without keeping the photo, or we delete and send new.
-            # Best approach: Edit caption to show status
             await query.edit_message_caption(caption=f"🚀 Sending broadcast to {len(recipients)} users...")
         else:
             await query.edit_message_text(f"🚀 Sending broadcast to {len(recipients)} users...")
     except Exception as e:
-        # Fallback if editing fails (e.g. message too old or type mismatch)
         logger.warning(f"Could not edit broadcast status message: {e}")
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -2994,19 +3055,33 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for user_id in recipients:
         try:
+            sent_msg = None
             if content["type"] == "photo":
-                await context.bot.send_photo(
+                sent_msg = await context.bot.send_photo(
                     chat_id=user_id,
                     photo=content["file_id"],
                     caption=content["text"],
                     parse_mode=ParseMode.HTML
                 )
             else:
-                await context.bot.send_message(
+                sent_msg = await context.bot.send_message(
                     chat_id=user_id,
                     text=content["text"],
                     parse_mode=ParseMode.HTML
                 )
+            
+            # Pinning Logic
+            if sent_msg and pin_mode in ["notify", "silent"]:
+                try:
+                    await context.bot.pin_chat_message(
+                        chat_id=user_id,
+                        message_id=sent_msg.message_id,
+                        disable_notification=(pin_mode == "silent")
+                    )
+                except Exception as pin_error:
+                     # Often fails if bot not admin or private chat restrictions, just log it
+                     logger.debug(f"Failed to pin for {user_id}: {pin_error}")
+
             success_count += 1
             await asyncio.sleep(0.05) # Rate limit protection
         except Exception as e:
@@ -3024,6 +3099,105 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel conversation"""
     await update.message.reply_text("❌ Broadcast cancelled.")
+    return ConversationHandler.END
+
+# --- UNPIN FEATURE ---
+
+UNPIN_TARGET, UNPIN_CONFIRM = range(2)
+
+async def unpin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the unpin wizard"""
+    user_id = str(update.effective_user.id)
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ You are not authorized.")
+        return ConversationHandler.END
+        
+    keyboard = [
+        [
+            InlineKeyboardButton("All Users", callback_data="target_all"),
+            InlineKeyboardButton("Active Users", callback_data="target_active")
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📌 <b>Unpin Wizard</b>\n\nWho do you want to unpin ALL messages for?\n"
+        "(This will clear the pin bar for these users)",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML
+    )
+    return UNPIN_TARGET
+
+async def unpin_target_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle target selection for unpinning"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Unpin cancelled.")
+        return ConversationHandler.END
+        
+    target = query.data.replace("target_", "")
+    context.user_data["unpin_target"] = target
+    
+    target_names = {"all": "All Users", "active": "Active Subscribers"}
+    
+    # Confirmation Step
+    keyboard = [
+        [InlineKeyboardButton("🗑️ YES, UNPIN EVERYTHING", callback_data="confirm_unpin")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]
+    ]
+    
+    await query.edit_message_text(
+        f"⚠️ <b>CONFIRM UNPIN</b>\n\nTarget: <b>{target_names.get(target, target)}</b>\n\n"
+        "Are you sure you want to remove ALL pinned messages for these users?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML
+    )
+    return UNPIN_CONFIRM
+
+async def unpin_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Execute unpin all"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Unpin cancelled.")
+        return ConversationHandler.END
+        
+    target = context.user_data.get("unpin_target")
+    
+    recipients = []
+    if target == "all":
+        recipients = sm.get_all_users()
+    elif target == "active":
+        recipients = sm.get_active_users()
+        
+    await query.edit_message_text(f"🗑️ Unpinning messages for {len(recipients)} users...")
+    logger.info(f"🗑️ Starting unpin_all for {len(recipients)} users (Target: {target})")
+    
+    count = 0
+    fail_count = 0
+    for user_id in recipients:
+        try:
+            # unpin_all_chat_messages returns True on success
+            success = await context.bot.unpin_all_chat_messages(chat_id=user_id)
+            if success:
+                count += 1
+            else:
+                logger.warning(f"   ⚠️ Unpin returned False for {user_id}")
+                fail_count += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.warning(f"   ❌ Unpin failed for {user_id}: {e}")
+            fail_count += 1
+            
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"✅ <b>Unpin Complete</b>\n\nCleared pins for {count} users.\nFailed/No Pins: {fail_count}",
+        parse_mode=ParseMode.HTML
+    )
     return ConversationHandler.END
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3109,6 +3283,7 @@ def run_bot():
             states={
                 BROADCAST_TARGET: [CallbackQueryHandler(broadcast_target)],
                 BROADCAST_MESSAGE: [MessageHandler(filters.TEXT | filters.PHOTO, broadcast_message_input)],
+                BROADCAST_PIN: [CallbackQueryHandler(broadcast_pin_choice)],
                 BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_confirm)],
             },
             fallbacks=[
@@ -3117,6 +3292,17 @@ def run_bot():
             ]
         )
         app.add_handler(broadcast_handler)
+
+        # Unpin Handler
+        unpin_handler = ConversationHandler(
+            entry_points=[CommandHandler("unpin_all", unpin_start)],
+            states={
+                UNPIN_TARGET: [CallbackQueryHandler(unpin_target_handler)],
+                UNPIN_CONFIRM: [CallbackQueryHandler(unpin_execute)]
+            },
+            fallbacks=[CallbackQueryHandler(broadcast_cancel, pattern="^cancel$")] # Reuse cancel
+        )
+        app.add_handler(unpin_handler)
 
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("gen", gen_code))
