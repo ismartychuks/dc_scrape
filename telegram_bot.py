@@ -2058,25 +2058,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = f"""
 👋 <b>Welcome to Hollowscan!</b>
 
-Hello {username}! Get instant product alerts with all the data you need.
+<i>Hello {username}!</i> Get instant product alerts with all the data you need.
 
-<b>🎯 Features:</b>
-• ⚡ Real-time notifications
+🎯 <b>Features:</b>
+• ⚡️ Real-time notifications
 • 🖼️ Product images
 • 🔗 Direct action links
 • 📊 Full stock & price data
 • ⏸️ Pause/Resume anytime
 
-<b>📋 Status:</b>
+📊 <b>Status:</b>
 """
     
     if sm.is_active(user_id):
         stats = sm.get_user_stats(user_id)
-        welcome_text += f"✅ <b>Active</b> - {stats['days_remaining']} days remaining\n"
+        welcome_text += f"✅ <b>Active</b> – {stats['days_remaining']} days remaining\n"
         if stats['is_paused']:
             welcome_text += "⏸️ Alerts currently paused\n"
     else:
         welcome_text += "❌ <b>Not subscribed</b>\n\nRedeem a code to get started!\n"
+
+    welcome_text += '\n💡 <b>Tip:</b> Click on "⚙️ <b>Alert Settings</b>" below to toggle ✅ on or ❌ off any country store you want to receive (or stop receiving) notifications from. Customize your experience!'
     
     await update.message.reply_text(
         welcome_text,
@@ -2101,24 +2103,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             welcome_text = f"""
 👋 <b>Welcome to Hollowscan!</b>
 
-Hello {username}! Get instant product alerts with all the data you need.
+<i>Hello {username}!</i> Get instant product alerts with all the data you need.
 
-<b>🎯 Features:</b>
-• ⚡ Real-time notifications
+🎯 <b>Features:</b>
+• ⚡️ Real-time notifications
 • 🖼️ Product images
 • 🔗 Direct action links
 • 📊 Full stock & price data
 • ⏸️ Pause/Resume anytime
 
-<b>📋 Status:</b>
+📊 <b>Status:</b>
 """
             if sm.is_active(user_id):
                 stats = sm.get_user_stats(user_id)
-                welcome_text += f"✅ <b>Active</b> - {stats['days_remaining']} days remaining\n"
+                welcome_text += f"✅ <b>Active</b> – {stats['days_remaining']} days remaining\n"
                 if stats['is_paused']:
                     welcome_text += "⏸️ Alerts currently paused\n"
             else:
                 welcome_text += "❌ <b>Not subscribed</b>\n\nRedeem a code to get started!\n"
+
+            welcome_text += '\n💡 <b>Tip:</b> Click on "⚙️ <b>Alert Settings</b>" below to toggle ✅ on or ❌ off any country store you want to receive (or stop receiving) notifications from. Customize your experience!'
             
             await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML, reply_markup=create_main_menu())
         return
