@@ -84,7 +84,8 @@ archiver_state = {
     "total_checks": 0,
     "idle_breaks_taken": 0,
     "mouse_movements": 0,
-    "scrolls_performed": 0
+    "scrolls_performed": 0,
+    "channel_metrics": {}  # {url: {'msg_count': 0, 'last_check': 0}}
 }
 stop_event = threading.Event()
 input_queue = queue.Queue()
@@ -443,6 +444,59 @@ def get_realistic_user_agent():
         agents.extend([agent] * weight)
     
     return random.choice(agents)
+
+def get_prioritized_channels(available_channels):
+    """
+    Sort channels by activity (message count) and apply weighted skipping.
+    High activity = Low skip chance (5-15%)
+    Low activity = High skip chance (60-85%)
+    """
+    prioritized = []
+    skipped = []
+    
+    # Ensure metrics exist
+    for url in available_channels:
+        if url not in archiver_state["channel_metrics"]:
+            archiver_state["channel_metrics"][url] = {'msg_count': 0, 'last_check': 0}
+            
+    # Calculate skip chances and filter
+    for url in available_channels:
+        metrics = archiver_state["channel_metrics"][url]
+        msg_count = metrics.get('msg_count', 0)
+        
+        # Determine Activity Tier & Skip Chance
+        if msg_count > 5:  # High Activity
+            skip_chance = random.uniform(0.05, 0.15)
+            tier = "HIGH"
+        elif msg_count > 0: # Moderate Activity
+            skip_chance = random.uniform(0.30, 0.50)
+            tier = "MID"
+        else: # Low Activity (0 messages)
+            skip_chance = random.uniform(0.60, 0.85)
+            tier = "LOW"
+            
+        # Roll the dice
+        if random.random() < skip_chance:
+            skipped.append(url)
+        else:
+            # specialized sorting score: msg_count + random noise (to shuffle equal tiers)
+            score = msg_count + random.uniform(0, 2)
+            prioritized.append({'url': url, 'score': score, 'tier': tier})
+    
+    # Sort by score descending (highest activity first)
+    prioritized.sort(key=lambda x: x['score'], reverse=True)
+    
+    final_list = [p['url'] for p in prioritized]
+    
+    # Log summary
+    log(f"📊 Channel Priority: Process {len(final_list)}/{len(available_channels)} (Skipped {len(skipped)})")
+    if prioritized:
+        top = prioritized[:3]
+        # Fixed f-string syntax (alternating quotes)
+        top_strs = [f"{p['url'].split('/')[-1]}({p['tier']})" for p in top]
+        log(f"   🔝 Top: {', '.join(top_strs)}")
+        
+    return final_list
 
 def get_next_check_interval():
     """Gaussian distribution for check intervals - more natural clustering"""
@@ -832,10 +886,6 @@ async def async_archiver_logic():
 
                 while not stop_event.is_set():
                     try:
-                        # Random idle break check
-                        if random.random() < IDLE_BREAK_CHANCE:
-                            await take_idle_break()
-                            if stop_event.is_set(): break
                         
                         # Login Logic
                         if "login" in page.url or "discord.com/channels" not in page.url:
@@ -900,27 +950,28 @@ async def async_archiver_logic():
                                 wait_cycles += 1
                                 if wait_cycles % 10 == 0: log(f"⏳ {wait_cycles*5}s elapsed...")
 
-                        # Shuffle channels for unpredictability
-                        # DYNAMIC CHANNEL LOADING
-                        cm.reload() # Sync from Supabase if needed
+
+                        # Dynamic Channel Ranking & Skipping
+                        cm.reload() 
                         enabled_channels = cm.get_enabled_channels()
-                        channels_to_check = [c['url'] for c in enabled_channels]
-                        if not channels_to_check:
-                            log("⚠️ No enabled channels found in config. Waiting...")
+                        all_urls = [c['url'] for c in enabled_channels]
+                        
+                        if not all_urls:
+                            log("⚠️ No enabled channels found. Waiting...")
                             await asyncio.sleep(60)
                             continue
 
-                        random.shuffle(channels_to_check)
-                        
-                        # Randomly skip some channels sometimes (10% chance per channel)
-                        if random.random() < 0.3:
-                            skip_count = random.randint(0, min(2, len(channels_to_check)))
-                            if skip_count > 0:
-                                channels_to_check = channels_to_check[skip_count:]
-                                log(f"🎲 Randomly skipping {skip_count} channel(s) this cycle")
+                        channels_to_check = get_prioritized_channels(all_urls)
                         
                         for channel_url in channels_to_check:
                             if stop_event.is_set(): break
+
+                            # --- IDLE BREAK CHECK (Per Channel) ---
+                            # Adjusted chance since it runs more often (4% per channel)
+                            if random.random() < 0.04: 
+                                await take_idle_break()
+                                # Re-check stop event after break
+                                if stop_event.is_set(): break
                             
                             # Persistent failure check
                             if archiver_state["error_counts"].get(channel_url, 0) > 2:
@@ -1027,6 +1078,12 @@ async def async_archiver_logic():
                                     
                                     # Random micro-delay between messages
                                     await asyncio.sleep(random.gauss(0.2, 0.1))
+
+                                # Update Activity Metrics
+                                if channel_url not in archiver_state["channel_metrics"]:
+                                    archiver_state["channel_metrics"][channel_url] = {'msg_count': 0}
+                                archiver_state["channel_metrics"][channel_url]['msg_count'] += len(batch)
+                                archiver_state["channel_metrics"][channel_url]['last_check'] = time.time()
 
                                 if batch:
                                     log(f"   ⬆️ {len(batch)} new message(s)")
