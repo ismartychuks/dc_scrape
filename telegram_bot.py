@@ -2383,11 +2383,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_text += f"✅ <b>Active</b> – {stats['days_remaining']} days remaining\n"
         if stats['is_paused']:
             welcome_text += "⏸️ Alerts currently paused\n"
+        
+        # Show tip only for active users
+        welcome_text += '\n💡 <b>Tip:</b> Click on "⚙️ <b>Alert Settings</b>" below to toggle ✅ on or ❌ off any country store you want to receive (or stop receiving) notifications from. Customize your experience!'
     else:
-        welcome_text += "❌ <b>Not subscribed</b>\n\nRedeem a code to get started!\n"
+        welcome_text += "❌ <b>Not subscribed</b>\n\nRedeem a code or subscribe below to get started!\n"
 
-    welcome_text += '\n💡 <b>Tip:</b> Click on "⚙️ <b>Alert Settings</b>" below to toggle ✅ on or ❌ off any country store you want to receive (or stop receiving) notifications from. Customize your experience!'
-    
     await update.message.reply_text(
         welcome_text,
         parse_mode=ParseMode.HTML,
@@ -2415,9 +2416,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 welcome_text += f"✅ <b>Active</b> – {stats['days_remaining']} days remaining\n"
                 if stats['is_paused']:
                     welcome_text += "⏸️ Alerts currently paused\n"
+                
+                # Show tip only for active users
+                welcome_text += '\n💡 <b>Tip:</b> Click on "⚙️ <b>Alert Settings</b>" below to toggle ✅ on or ❌ off any country store you want to receive (or stop receiving) notifications from. Customize your experience!'
             else:
-                welcome_text += "❌ <b>Not subscribed</b>\n\nRedeem a code to get started!\n"
-            welcome_text += '\n💡 <b>Tip:</b> Click on "⚙️ <b>Alert Settings</b>" below to toggle ✅ on or ❌ off any country store you want to receive (or stop receiving) notifications from. Customize your experience!'
+                welcome_text += "❌ <b>Not subscribed</b>\n\nRedeem a code or subscribe below to get started!\n"
+            
             await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML, reply_markup=create_main_menu(user_id))
             return
             
