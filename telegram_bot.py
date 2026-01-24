@@ -8,6 +8,7 @@ import requests
 import random
 import asyncio
 import re
+import stripe
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -600,6 +601,12 @@ class SubscriptionManager:
         self.local_users_path = f"data/{USERS_FILE}"
         self.local_codes_path = f"data/{CODES_FILE}"
         self.local_potential_path = f"data/{POTENTIAL_USERS_FILE}"
+        
+        # Stripe Config
+        self.stripe_price_id_monthly = os.getenv("STRIPE_PRICE_ID_MONTHLY")
+        self.stripe_price_id_yearly = os.getenv("STRIPE_PRICE_ID_YEARLY")
+        self.domain = os.getenv("DOMAIN", "http://localhost:5000")
+        
         os.makedirs("data", exist_ok=True)
         self._load_state()
 
@@ -774,6 +781,94 @@ class SubscriptionManager:
                 self.potential_users.pop(str(user_id))
             self._sync_state()
             return True
+
+    def process_stripe_event(self, event):
+        """Handle Stripe Webhook events"""
+        event_type = event['type']
+        data_object = event['data']['object']
+        
+        # Extract user_id from metadata or client_reference_id
+        user_id = data_object.get('client_reference_id') or data_object.get('metadata', {}).get('user_id')
+        
+        if event_type == 'checkout.session.completed':
+            customer_id = data_object.get('customer')
+            subscription_id = data_object.get('subscription')
+            
+            # Identify the plan duration from the subscription
+            days_to_add = 30 # Default Monthly
+            try:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                plan_interval = sub['items']['data'][0]['plan']['interval']
+                if plan_interval == 'year':
+                    days_to_add = 365 # Yearly
+            except Exception as e:
+                logger.warning(f"Could not determine plan interval: {e}")
+
+            if user_id:
+                with self.lock:
+                    uid = str(user_id)
+                    if uid not in self.users:
+                        # Create user entry if it doesn't exist
+                        self.users[uid] = {
+                            "expiry": (datetime.utcnow() + timedelta(days=days_to_add)).isoformat(),
+                            "username": data_object.get('customer_details', {}).get('name', 'Stripe User'),
+                            "joined_at": datetime.utcnow().isoformat(),
+                            "alerts_paused": False
+                        }
+                    
+                    self.users[uid]["stripe_customer_id"] = customer_id
+                    self.users[uid]["stripe_subscription_id"] = subscription_id
+                    
+                    # Set expiry based on plan
+                    new_expiry = datetime.utcnow() + timedelta(days=days_to_add)
+                    self.users[uid]["expiry"] = new_expiry.isoformat()
+                    
+                    if uid in self.potential_users:
+                        self.potential_users.pop(uid)
+                    
+                    self._sync_state()
+                    logger.info(f"💰 Stripe: User {uid} subscribed via Checkout.")
+                    
+                    # Notify user (we need bot instance, usually available globally or via callback)
+                    # We'll rely on the next poll/interaction for now or use a shared queue
+        
+        elif event_type == 'invoice.paid':
+            # Recurring payment success
+            customer_id = data_object.get('customer')
+            subscription_id = data_object.get('subscription')
+            
+            days_to_add = 30
+            try:
+                sub = stripe.Subscription.retrieve(subscription_id)
+                plan_interval = sub['items']['data'][0]['plan']['interval']
+                if plan_interval == 'year':
+                    days_to_add = 365
+            except: pass
+
+            if customer_id:
+                with self.lock:
+                    # Find user by customer_id
+                    for uid, udata in self.users.items():
+                        if udata.get('stripe_customer_id') == customer_id:
+                            new_expiry = datetime.utcnow() + timedelta(days=days_to_add)
+                            self.users[uid]["expiry"] = new_expiry.isoformat()
+                            self._sync_state()
+                            logger.info(f"✅ Stripe: User {uid} subscription renewed ({days_to_add} days).")
+                            break
+                            
+        elif event_type == 'customer.subscription.deleted':
+            # Subscription cancelled or expired
+            customer_id = data_object.get('customer')
+            if customer_id:
+                with self.lock:
+                    for uid, udata in self.users.items():
+                        if udata.get('stripe_customer_id') == customer_id:
+                            # Immediate expiry or let it run out? 
+                            # Stripe usually sends this when it FINALLY ends.
+                            self.users[uid]["expiry"] = datetime.utcnow().isoformat()
+                            self._sync_state()
+                            logger.info(f"❌ Stripe: User {uid} subscription terminated.")
+                            break
 
     def get_active_users(self) -> List[str]:
         active = []
@@ -1957,15 +2052,33 @@ def is_restock_filter_match(msg_data: Dict) -> bool:
     return False
 
 
-def create_main_menu() -> InlineKeyboardMarkup:
+def create_main_menu(user_id: str = None) -> InlineKeyboardMarkup:
     """Create main menu keyboard"""
-    keyboard = [
-        [InlineKeyboardButton("📊 My Status", callback_data="status")],
-        [InlineKeyboardButton("⚙️ Alert Settings", callback_data="settings")],
-        [InlineKeyboardButton("🔔 Toggle Alerts", callback_data="toggle_pause")],
-        [InlineKeyboardButton("🎟️ Redeem Code", callback_data="redeem")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")]
-    ]
+    keyboard = []
+    uid = str(user_id) if user_id else None
+    user_data = sm.users.get(uid, {}) if uid else {}
+    is_active = sm.is_active(uid) if uid else False
+    has_stripe = bool(user_data.get("stripe_customer_id"))
+    
+    if is_active:
+        keyboard.append([InlineKeyboardButton("📊 My Status", callback_data="status")])
+        keyboard.append([InlineKeyboardButton("⚙️ Alert Settings", callback_data="settings")])
+        keyboard.append([InlineKeyboardButton("🔔 Toggle Alerts", callback_data="toggle_pause")])
+        
+        # Bottom options - Everyone can use a code to add more days
+        keyboard.append([InlineKeyboardButton("🎟️ Redeem Code", callback_data="redeem")])
+
+        if has_stripe:
+            keyboard.append([InlineKeyboardButton("💳 Manage Stripe / Billing", callback_data="billing")])
+        else:
+            # For code users, rename "Premium" to "Subscribe" to imply a shift to automated billing
+            keyboard.append([InlineKeyboardButton("💎 Subscribe (Automated Billing)", callback_data="subscribe")])
+    else:
+        # User is expired or new
+        keyboard.append([InlineKeyboardButton("💎 GET PREMIUM (Stripe)", callback_data="subscribe")])
+        keyboard.append([InlineKeyboardButton("🎟️ Redeem Code", callback_data="redeem")])
+        
+    keyboard.append([InlineKeyboardButton("❓ Help & Commands", callback_data="help")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -2095,6 +2208,118 @@ async def test_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Test error: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show plan selection menu"""
+    user_id = str(update.effective_user.id)
+    msg = update.effective_message
+    
+    if not sm.stripe_price_id_monthly:
+        if msg:
+            await msg.reply_text("❌ Payments are currently disabled (Price ID not set).")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("📅 Monthly Plan - £X/mo", callback_data="sub_choice:monthly")],
+        [InlineKeyboardButton("🗓️ Yearly Plan - £X/yr", callback_data="sub_choice:yearly")],
+        [InlineKeyboardButton("◀️ Back", callback_data="back:main")]
+    ]
+    
+    reply_text = """
+💎 <b>Upgrade to Hollowscan Premium</b>
+
+Choose the plan that fits you best. Get instant professional alerts, full stock data, and direct action links.
+
+✨ <b>Benefits:</b>
+• ⚡️ Real-time notifications
+• 🖼️ Product images
+• 🔗 Direct action links
+• 📊 Full stock & price data
+• ⏸️ Pause/Resume anytime
+"""
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(reply_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def handle_subscribe_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate Checkout link for specific plan"""
+    query = update.callback_query
+    await query.answer()
+    
+    user = update.effective_user
+    user_id = str(user.id)
+    choice = query.data.split(":")[1]
+    
+    price_id = sm.stripe_price_id_monthly if choice == "monthly" else sm.stripe_price_id_yearly
+    
+    if not price_id:
+        await query.edit_message_text("❌ This plan is currently unavailable.")
+        return
+
+    await query.edit_message_text("⏳ Generating your secure checkout link...")
+    
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price': price_id,
+                'quantity': 1,
+            }],
+            mode='subscription',
+            client_reference_id=user_id,
+            metadata={'user_id': user_id, 'username': user.username or user.first_name, 'plan': choice},
+            success_url=f"{sm.domain}/success",
+            cancel_url=f"{sm.domain}/cancel",
+        )
+        
+        reply_text = f"""
+🚀 <b>Your {choice.capitalize()} Subscription Link</b>
+
+Click below to complete your payment securely via Stripe:
+
+{session.url}
+
+<i>Link expires in 24 hours. Subscription renews automatically every {choice[:-2] if choice=='monthly' else 'year'}.</i>
+"""
+        # We can't use edit_message_text because of the link length sometimes causing issues with InlineButtons or just to be clean
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=reply_text,
+            parse_mode=ParseMode.HTML
+        )
+        
+    except Exception as e:
+        logger.error(f"Stripe Session Error: {e}")
+        await query.edit_message_text("❌ Failed to generate checkout link. Please contact admin.")
+
+async def billing_portal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate Stripe Billing Portal Link"""
+    user_id = str(update.effective_user.id)
+    user_data = sm.users.get(user_id, {})
+    customer_id = user_data.get("stripe_customer_id")
+    
+    # Safety: identify if this is a callback or a message
+    msg = update.effective_message
+    
+    if not customer_id:
+        text = "❌ You don't have an active automated subscription. If you used a code, contact admin."
+        if msg:
+            await msg.reply_text(text)
+        return
+
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=f"https://t.me/{(await context.bot.get_me()).username}",
+        )
+        text = f"🛠️ <b>Manage Your Subscription</b>\n\nUse the link below to update your payment method or cancel your subscription:\n\n{session.url}"
+        if msg:
+            await msg.reply_text(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Stripe Portal Error: {e}")
+        await update.message.reply_text("❌ Error opening billing portal.")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Welcome message with main menu"""
     user_id = str(update.effective_user.id)
@@ -2131,7 +2356,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         welcome_text,
         parse_mode=ParseMode.HTML,
-        reply_markup=create_main_menu()
+        reply_markup=create_main_menu(user_id)
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2158,7 +2383,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 welcome_text += "❌ <b>Not subscribed</b>\n\nRedeem a code to get started!\n"
             welcome_text += '\n💡 <b>Tip:</b> Click on "⚙️ <b>Alert Settings</b>" below to toggle ✅ on or ❌ off any country store you want to receive (or stop receiving) notifications from. Customize your experience!'
-            await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML, reply_markup=create_main_menu())
+            await query.edit_message_text(welcome_text, parse_mode=ParseMode.HTML, reply_markup=create_main_menu(user_id))
             return
             
         elif menu_to_go == "settings":
@@ -2224,6 +2449,20 @@ Get a code from your administrator!
 """
         buttons = []
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=create_menu_with_back(buttons, "main"))
+    
+    elif action == "subscribe":
+        # Redirect to subscribe command logic
+        await subscribe(update, context)
+        return
+
+    elif action == "billing":
+        # Redirect to billing portal logic
+        await billing_portal(update, context)
+        return
+    
+    elif action.startswith("sub_choice:"):
+        await handle_subscribe_choice(update, context)
+        return
     
     elif action == "settings":
         if not sm.is_active(user_id):
@@ -3327,6 +3566,8 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📋 <b>Available Commands</b>
 
 /start - Main menu & status
+/subscribe - Upgrade to Premium
+/billing - Manage subscription
 /help - Show this command list
 
 Use the menu buttons for more options!
@@ -3427,6 +3668,8 @@ def run_bot():
         app.add_handler(CommandHandler("add_channel", add_channel_cmd))
         app.add_handler(CommandHandler("remove_channel", remove_channel_cmd))
         app.add_handler(CommandHandler("channels", list_channels_cmd))
+        app.add_handler(CommandHandler("subscribe", subscribe))
+        app.add_handler(CommandHandler("billing", billing_portal))
         app.add_handler(CommandHandler("help", show_help))  # Help command
         app.add_handler(CallbackQueryHandler(button_handler))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

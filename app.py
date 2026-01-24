@@ -20,8 +20,13 @@ from flask import Flask, render_template_string, jsonify
 from flask_socketio import SocketIO
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 import supabase_utils
+import stripe
 from dotenv import load_dotenv
 load_dotenv()
+
+# --- STRIPE CONFIG ---
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 nest_asyncio.apply()
 
@@ -1639,6 +1644,34 @@ def test_channel():
 
 @app.route('/health')
 def health(): return jsonify({"status": "ok"})
+
+@app.route('/webhook/stripe', methods=['POST'])
+def stripe_webhook():
+    payload = request.data
+    sig_header = request.headers.get('Stripe-Signature')
+
+    if not STRIPE_WEBHOOK_SECRET:
+        log("⚠️ STRIPE_WEBHOOK_SECRET not set")
+        return 'Webhook Secret Missing', 500
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except ValueError as e:
+        return 'Invalid payload', 400
+    except stripe.error.SignatureVerificationError as e:
+        return 'Invalid signature', 400
+
+    # Import bot's subscription manager to process events
+    try:
+        from telegram_bot import sm
+        sm.process_stripe_event(event)
+    except Exception as e:
+        log(f"❌ Stripe Webhook Error: {e}")
+        return 'Internal Server Error', 500
+
+    return jsonify(success=True)
 
 @socketio.on('input')
 def handle_input(data): input_queue.put(data)
