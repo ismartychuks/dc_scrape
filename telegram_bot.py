@@ -2255,8 +2255,8 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = [
-        [InlineKeyboardButton("📅 Monthly Plan - £X/mo", callback_data="sub_choice:monthly")],
-        [InlineKeyboardButton("🗓️ Yearly Plan - £X/yr", callback_data="sub_choice:yearly")],
+        [InlineKeyboardButton("📅 Monthly Plan - $14.99/mo", callback_data="sub_choice:monthly")],
+        [InlineKeyboardButton("🗓️ Yearly Plan - $140.00/yr", callback_data="sub_choice:yearly")],
         [InlineKeyboardButton("◀️ Back", callback_data="back:main")]
     ]
     
@@ -2305,8 +2305,8 @@ async def handle_subscribe_choice(update: Update, context: ContextTypes.DEFAULT_
             mode='subscription',
             client_reference_id=user_id,
             metadata={'user_id': user_id, 'username': user.username or user.first_name, 'plan': choice},
-            success_url=f"{sm.domain}/success",
-            cancel_url=f"{sm.domain}/cancel",
+            success_url=f"https://t.me/{(await context.bot.get_me()).username}",
+            cancel_url=f"https://t.me/{(await context.bot.get_me()).username}",
         )
         
         reply_text = f"""
@@ -2592,12 +2592,18 @@ Get a code from your administrator!
 ❓ <b>Help & Information</b>
 
 <b>How It Works:</b>
-1️⃣ Redeem a subscription code
+1️⃣ Redeem a code OR Subscribe via Stripe
 2️⃣ Receive real-time alerts with images & links
 3️⃣ Click buttons to check eBay, Keepa, Amazon instantly
 
+<b>Getting Premium:</b>
+• Use <b>/subscribe</b> to pick a monthly/yearly plan
+• Use <b>/start</b> to redeem a promo code
+• Use <b>/billing</b> to manage your subscription
+
 <b>Commands:</b>
 • /start - Main menu & status
+• /subscribe - Upgrade to Premium
 
 <b>Tips:</b>
 • Enable Telegram notifications

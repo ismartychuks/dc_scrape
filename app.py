@@ -15,7 +15,7 @@ import re
 import random
 import math
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request
 from flask_socketio import SocketIO
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 import supabase_utils
