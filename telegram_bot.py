@@ -2273,8 +2273,8 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = [
-        [InlineKeyboardButton("📅 Monthly Plan - $14.99/mo", callback_data="sub_choice:monthly")],
-        [InlineKeyboardButton("🗓️ Yearly Plan - $140.00/yr", callback_data="sub_choice:yearly")],
+        [InlineKeyboardButton("📅 Monthly Plan - £4.99/mo", callback_data="sub_choice:monthly")],
+        [InlineKeyboardButton("🗓️ Yearly Plan - £140.00/yr", callback_data="sub_choice:yearly")],
         [InlineKeyboardButton("◀️ Back", callback_data="back:main")]
     ]
     
@@ -2370,9 +2370,27 @@ async def billing_portal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"🛠️ <b>Manage Your Subscription</b>\n\nUse the link below to update your payment method or cancel your subscription:\n\n{session.url}"
         if msg:
             await msg.reply_text(text, parse_mode=ParseMode.HTML)
+    except stripe.error.InvalidRequestError as e:
+        logger.error(f"Stripe Customer Error: {e}")
+        if "No such customer" in str(e):
+            # Clean up stale ID
+            with sm.lock:
+                if "stripe_customer_id" in sm.users.get(user_id, {}):
+                    del sm.users[user_id]["stripe_customer_id"]
+                if "stripe_subscription_id" in sm.users.get(user_id, {}):
+                    del sm.users[user_id]["stripe_subscription_id"]
+                sm._sync_state()
+            
+            if msg:
+                await msg.reply_text("⚠️ Your subscription record was not found in Stripe (likely a Test/Live mismatch). I have reset your billing link. Please try /subscribe to link a valid account.")
+        else:
+            if msg:
+                await msg.reply_text(f"❌ Stripe Error: {str(e)}")
+
     except Exception as e:
         logger.error(f"Stripe Portal Error: {e}")
-        await update.message.reply_text("❌ Error opening billing portal.")
+        if msg:
+            await msg.reply_text("❌ Error opening billing portal.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Welcome message with main menu"""
