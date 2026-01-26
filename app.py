@@ -1694,9 +1694,18 @@ def stripe_webhook():
 def handle_input(data): input_queue.put(data)
 
 
+# if __name__ == '__main__':
+#     import telegram_bot
+#     if os.getenv("TELEGRAM_TOKEN"):
+#         t_bot = threading.Thread(target=telegram_bot.run_bot, daemon=True)
+#         t_bot.start()
+#     socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
+
 if __name__ == '__main__':
     import telegram_bot
     if os.getenv("TELEGRAM_TOKEN"):
         t_bot = threading.Thread(target=telegram_bot.run_bot, daemon=True)
         t_bot.start()
-    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
+    
+    # SSL is handled by Nginx, so we just run standard socketio on localhost
+    socketio.run(app, host='127.0.0.1', port=5000, debug=False, allow_unsafe_werkzeug=True)
