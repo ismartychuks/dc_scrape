@@ -786,12 +786,18 @@ class SubscriptionManager:
                 except: pass
             
             new_expiry = current_expiry + timedelta(days=days)
-            self.users[str(user_id)] = {
-                "expiry": new_expiry.isoformat(), 
-                "username": username or "Unknown",
-                "alerts_paused": False,
-                "joined_at": self.users.get(str(user_id), {}).get("joined_at", datetime.utcnow().isoformat())
-            }
+            # Retrieve existing data or initialize new
+            user_data = self.users.get(str(user_id), {})
+            
+            # Update fields
+            user_data["expiry"] = new_expiry.isoformat()
+            user_data["username"] = username or user_data.get("username", "Unknown")
+            if "alerts_paused" not in user_data:
+                user_data["alerts_paused"] = False
+            if "joined_at" not in user_data:
+                user_data["joined_at"] = datetime.utcnow().isoformat()
+            
+            self.users[str(user_id)] = user_data
             if str(user_id) in self.potential_users:
                 self.potential_users.pop(str(user_id))
             self._sync_state()
