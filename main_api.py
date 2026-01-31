@@ -310,6 +310,89 @@ async def get_categories():
     print(f"[CATEGORIES] Loaded categories: {result}")
     return result
 
+# Debug endpoint to check channel-to-region mapping
+@app.get("/v1/debug/channels")
+async def debug_channels():
+    """Debug endpoint: Show which region each channel is mapped to"""
+    channels = []
+    
+    try:
+        channels_response = requests.get(
+            f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json",
+            timeout=10
+        )
+        if channels_response.status_code == 200:
+            channels = channels_response.json() or []
+    except: pass
+
+    if not channels and os.path.exists("data/channels.json"):
+        try:
+            with open("data/channels.json", "r") as f:
+                channels = json.load(f)
+        except: pass
+
+    if not channels:
+        channels = DEFAULT_CHANNELS
+
+    # Build mapping
+    mapping = {"UK Stores": [], "USA Stores": [], "Canada Stores": []}
+    unknown = []
+    known_ids = set()
+    
+    for c in channels:
+        if not c.get('enabled', True):
+            continue
+            
+        ch_id = c.get('id')
+        ch_name = c.get('name')
+        raw_region = c.get('category', 'USA Stores').strip()
+        known_ids.add(ch_id)
+        
+        # Normalize region
+        if raw_region == 'UK Stores' or 'UK' in raw_region.upper():
+            msg_region = 'UK Stores'
+        elif raw_region == 'Canada Stores' or 'CANADA' in raw_region.upper():
+            msg_region = 'Canada Stores'
+        elif raw_region == 'USA Stores' or 'USA' in raw_region.upper():
+            msg_region = 'USA Stores'
+        else:
+            msg_region = 'UNKNOWN'
+            unknown.append({'id': ch_id, 'name': ch_name, 'raw_category': raw_region})
+        
+        if msg_region in mapping:
+            mapping[msg_region].append({'id': ch_id, 'name': ch_name, 'raw_category': raw_region})
+    
+    # Find orphaned channel IDs (in messages but not in channels.json)
+    try:
+        messages_response = requests.get(
+            f"{URL}/rest/v1/discord_messages?select=channel_id&order=scraped_at.desc&limit=300",
+            headers=HEADERS,
+            timeout=15
+        )
+        if messages_response.status_code == 200:
+            messages = messages_response.json()
+            orphaned_ids = {}
+            for msg in messages:
+                ch_id = str(msg.get('channel_id', ''))
+                if ch_id and ch_id not in known_ids:
+                    orphaned_ids[ch_id] = orphaned_ids.get(ch_id, 0) + 1
+            
+            # Show top orphaned IDs
+            orphaned_list = sorted(orphaned_ids.items(), key=lambda x: x[1], reverse=True)[:10]
+            orphaned_detail = [{"id": ch_id, "message_count": count} for ch_id, count in orphaned_list]
+        else:
+            orphaned_detail = []
+    except Exception as e:
+        print(f"[DEBUG] Error fetching orphaned IDs: {e}")
+        orphaned_detail = []
+    
+    return {
+        "total_channels": len(known_ids),
+        "mapping": mapping,
+        "unknown_regions": unknown,
+        "orphaned_channel_ids": orphaned_detail
+    }
+
 # -------------------
 # DEDUPLICATION HELPER (mirrors telegram_bot.py)
 # -------------------
@@ -420,19 +503,24 @@ async def get_feed(
     if not channels:
         channels = DEFAULT_CHANNELS
 
-    # Build channel map
+    # Build channel map - prefer channels from JSON over defaults
     channel_map = {}
-    for c in DEFAULT_CHANNELS:
-        channel_map[c['id']] = {
-            'category': c.get('category', 'USA Stores'),
-            'name': c.get('name', 'Unknown')
-        }
-        
+    
+    # First add channels from loaded JSON (takes priority)
     for c in channels:
-        channel_map[c['id']] = {
-            'category': c.get('category', 'USA Stores'),
-            'name': c.get('name', 'Unknown')
-        }
+        if c.get('enabled', True):  # Only include enabled channels
+            channel_map[c['id']] = {
+                'category': c.get('category', 'USA Stores').strip(),
+                'name': c.get('name', 'Unknown').strip()
+            }
+    
+    # Then add DEFAULT_CHANNELS only if not already in map
+    for c in DEFAULT_CHANNELS:
+        if c['id'] not in channel_map:
+            channel_map[c['id']] = {
+                'category': c.get('category', 'USA Stores').strip(),
+                'name': c.get('name', 'Unknown').strip()
+            }
     
     # 3. Transform messages into structured product cards
     def extract_product(msg):
@@ -441,15 +529,26 @@ async def get_feed(
         
         # Get channel info
         ch_id = str(msg.get("channel_id", ""))
-        ch_info = channel_map.get(ch_id, {'category': 'USA Stores', 'name': 'Unknown'})
+        ch_info = channel_map.get(ch_id)
         
-        # Get full region name and normalize
+        # SKIP messages from unknown channels (not in channels.json)
+        if not ch_info:
+            print(f"[FEED] Skipping message {msg.get('id')} - channel {ch_id} not in map")
+            return None
+        
+        # Get full region name - use directly from channel category (already normalized)
         raw_region = ch_info.get('category', 'USA Stores').strip()
-        if 'UK' in raw_region.upper():
+        
+        # Normalize region: ensure it's one of the exact 3 names
+        if raw_region == 'UK Stores' or 'UK' in raw_region.upper():
             msg_region = 'UK Stores'
-        elif 'CANADA' in raw_region.upper() or raw_region.upper().startswith('CA'):
+        elif raw_region == 'Canada Stores' or 'CANADA' in raw_region.upper():
             msg_region = 'Canada Stores'
+        elif raw_region == 'USA Stores' or 'USA' in raw_region.upper() or 'UNITED STATES' in raw_region.upper():
+            msg_region = 'USA Stores'
         else:
+            # Default fallback - log this
+            print(f"[WARN] Unknown region in channel {ch_id}: '{raw_region}'")
             msg_region = 'USA Stores'
         
         # Subcategory is the store name
@@ -554,13 +653,21 @@ async def get_feed(
             
             product = extract_product(msg)
             
+            # SKIP if product is None (unknown channel)
+            if not product:
+                continue
+            
             # Skip products without a price
             if not product["product_data"]["price"]:
                 continue
             
             # Apply region filter (if specified)
             if region and region.strip() and region != "ALL":
-                if product["region"] != region:
+                # Normalize both sides for comparison
+                requested_region = region.strip()
+                product_region = product["region"].strip()
+                
+                if product_region != requested_region:
                     continue
             
             # Apply store filter (if specified and not ALL)
@@ -572,7 +679,13 @@ async def get_feed(
             seen_signatures.add(sig)
             
         except Exception as e:
+            print(f"[FEED] Error processing message {msg.get('id')}: {e}")
             continue
+    
+    # Log what was returned
+    region_name = region or "ALL"
+    category_name = category or "ALL"
+    print(f"[FEED] Returned {len(products)} products for region='{region_name}' category='{category_name}'")
     
     # 5. Check user quota for free users
     user = get_user_from_db(user_id)
