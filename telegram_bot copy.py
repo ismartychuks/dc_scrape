@@ -1326,10 +1326,6 @@ class ChannelManager:
         try:
             with open(self.local_path, 'w') as f: json.dump(self.channels, f, indent=2)
             supabase_utils.upload_file(self.local_path, SUPABASE_BUCKET, self.remote_path, debug=False)
-            
-            # Sync to SQL Categories table for the Mobile App
-            supabase_utils.sync_categories_to_sql(self.channels)
-            
         except Exception as e:
             logger.error(f"Channel sync error: {e}")
 
@@ -2395,164 +2391,6 @@ async def billing_portal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Stripe Portal Error: {e}")
         if msg:
             await msg.reply_text("❌ Error opening billing portal.")
-
-async def link_app_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Link Telegram account to app account using link key"""
-    user_id = str(update.effective_user.id)
-    username = update.effective_user.username or update.effective_user.first_name
-    
-    # Get link key from command args
-    if not context.args or len(context.args) < 1:
-        await update.message.reply_text(
-            "❌ <b>Invalid Link Key</b>\n\n"
-            "Usage: <code>/link ABC123</code>\n\n"
-            "Get your link key from the HollowScan app:\n"
-            "1. Open the app\n"
-            "2. Go to Profile\n"
-            "3. Tap 'Connect Telegram'\n"
-            "4. Copy the link key\n"
-            "5. Come back here and send: /link [KEY]",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    link_key = context.args[0].upper()  # e.g., "ABC123"
-    
-    try:
-        print(f"[LINK] Attempting to link {username} (ID: {user_id}) with key {link_key}")
-        
-        # 1. Load pending links from backend
-        import os
-        links_file = "data/pending_telegram_links.json"
-        
-        if not os.path.exists(links_file):
-            await update.message.reply_text(
-                "❌ <b>Invalid Link Key</b>\n\n"
-                "This key is not recognized or has expired.\n\n"
-                "Please get a new link key from the HollowScan app.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-        
-        with open(links_file, 'r') as f:
-            pending_links = json.load(f)
-        
-        # 2. Check if key exists and is valid
-        if link_key not in pending_links:
-            await update.message.reply_text(
-                "❌ <b>Invalid Link Key</b>\n\n"
-                f"The key '<code>{link_key}</code>' is not recognized or has expired.\n\n"
-                "Please get a new link key from the HollowScan app.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-        
-        link_info = pending_links[link_key]
-        
-        # 3. Check if already used
-        if link_info.get('used'):
-            await update.message.reply_text(
-                "⚠️ <b>Already Linked</b>\n\n"
-                f"This link key has already been used.\n\n"
-                "Get a new link key from the HollowScan app.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-        
-        # 4. Check if expired (15 minute window)
-        from datetime import datetime, timezone
-        try:
-            expires_at = datetime.fromisoformat(link_info['expires_at'].replace('Z', '+00:00'))
-            if datetime.now(timezone.utc) > expires_at:
-                await update.message.reply_text(
-                    "⏰ <b>Link Key Expired</b>\n\n"
-                    "This link key has expired (valid for 15 minutes).\n\n"
-                    "Get a new link key from the HollowScan app.",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-        except Exception as e:
-            logger.error(f"Error checking expiry: {e}")
-        
-        # 5. Get the app user ID from the pending link
-        app_user_id = link_info['user_id']
-        
-        # 6. Mark link as used and update with Telegram info
-        link_info['used'] = True
-        link_info['used_at'] = datetime.now(timezone.utc).isoformat()
-        link_info['telegram_id'] = user_id
-        link_info['telegram_username'] = username
-        
-        with open(links_file, 'w') as f:
-            json.dump(pending_links, f, indent=2)
-        
-        print(f"[LINK] Key {link_key} marked as used for Telegram user {user_id}")
-        
-        # 7. Call the backend endpoint to complete the linking
-        import requests
-        api_url = "http://localhost:8000/v1/user/telegram/link"
-        
-        try:
-            response = requests.post(
-                api_url,
-                params={
-                    "user_id": app_user_id,
-                    "telegram_chat_id": int(user_id),
-                    "telegram_username": username
-                },
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get('is_premium'):
-                    await update.message.reply_text(
-                        "🎉 <b>Account Linked & Premium Synced!</b>\n\n"
-                        "Your HollowScan app account has been successfully linked to Telegram!\n"
-                        "Your premium status has been synced from the app.\n\n"
-                        f"✨ Premium until: {data.get('premium_until', 'N/A')}",
-                        parse_mode=ParseMode.HTML
-                    )
-                else:
-                    await update.message.reply_text(
-                        "✅ <b>Account Linked!</b>\n\n"
-                        "Your HollowScan app account has been successfully linked to Telegram!\n\n"
-                        "💡 <b>Tip:</b> Upgrade to premium in the app to unlock all features.",
-                        parse_mode=ParseMode.HTML
-                    )
-                print(f"[LINK] Successfully linked {username} (Telegram {user_id}) to app user {app_user_id}")
-            else:
-                logger.error(f"Backend error: {response.status_code} {response.text}")
-                await update.message.reply_text(
-                    "⚠️ <b>Linking Failed</b>\n\n"
-                    "There was an error connecting to the app backend.\n\n"
-                    "Please try again or contact support.",
-                    parse_mode=ParseMode.HTML
-                )
-        
-        except requests.exceptions.RequestException as req_error:
-            logger.error(f"Request error: {req_error}")
-            await update.message.reply_text(
-                "⚠️ <b>Linking Failed</b>\n\n"
-                "Could not reach the app backend. Please try again shortly.",
-                parse_mode=ParseMode.HTML
-            )
-    
-    except json.JSONDecodeError:
-        logger.error("Error decoding pending links JSON")
-        await update.message.reply_text(
-            "⚠️ <b>System Error</b>\n\n"
-            "There was an error processing your link. Please try again.",
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as e:
-        logger.error(f"Link error: {e}")
-        await update.message.reply_text(
-            "❌ <b>Linking Error</b>\n\n"
-            f"Error: {str(e)}",
-            parse_mode=ParseMode.HTML
-        )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Welcome message with main menu"""
@@ -3922,7 +3760,6 @@ def run_bot():
         app.add_handler(unpin_handler)
 
         app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("link", link_app_account))
         app.add_handler(CommandHandler("gen", gen_code))
         app.add_handler(CommandHandler("add_admin", add_bot_admin))
         app.add_handler(CommandHandler("remove_admin", remove_bot_admin))

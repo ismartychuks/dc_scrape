@@ -227,6 +227,134 @@ def test_single_message(message: Dict[str, Any]) -> bool:
     return result
 
 
+# -------------------
+# CATEGORY SYNC FOR MOBILE APP
+# -------------------
+def sync_categories_to_sql(categories_list: List[Dict], debug: bool = True) -> bool:
+    """
+    Sync bot channels to the Supabase SQL 'categories' table.
+    Ensures mobile filters match the active channels.
+    """
+    if not categories_list:
+        return False
+        
+    url, key = get_supabase_config()
+    headers = {
+        'apikey': key,
+        'Authorization': f'Bearer {key}',
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=merge-duplicates, return=minimal'
+    }
+    
+    endpoint = f"{url}/rest/v1/categories"
+    
+    # 1. Map Bot Categories to SQL Structure
+    # Bot 'category' field examples: "US Stores", "UK Stores", "Canada Stores"
+    # SQL fields: country_code, category_name, display_name
+    
+    sql_categories = []
+    seen = set()
+    
+    for c in categories_list:
+        raw_cat = c.get('category', 'US Stores').upper()
+        
+        # Determine Country Code
+        if 'UK' in raw_cat:
+            country = 'UK'
+        elif 'CANADA' in raw_cat or 'CA ' in raw_cat:
+            country = 'CA'
+        else:
+            country = 'US'
+            
+        sub_name = c.get('name', 'Unknown')
+        
+        # Unique check within this batch
+        key_pair = (country, sub_name)
+        if key_pair in seen:
+            continue
+        seen.add(key_pair)
+        
+        sql_categories.append({
+            "country_code": country,
+            "category_name": sub_name,
+            "display_name": f"{country} {sub_name}",
+            "active": True
+        })
+        
+    if not sql_categories:
+        return False
+        
+    try:
+        # Upsert into SQL
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=sql_categories,
+            timeout=30
+        )
+        
+        if response.status_code in [200, 201, 204]:
+            if debug: print(f"✅ Synced {len(sql_categories)} categories to SQL")
+            return True
+        else:
+            if debug: 
+                print(f"❌ Category sync failed: HTTP {response.status_code}")
+                print(f"   Response: {response.text}")
+            return False
+            
+    except Exception as e:
+        if debug: print(f"❌ Category sync error: {e}")
+        return False
+
+
+# -------------------
+# ALERT STORAGE FOR MOBILE APP
+# -------------------
+def insert_alert(country_code: str, category_name: str, product_data: Dict, debug: bool = True) -> bool:
+    """
+    Insert a structured product alert into the Supabase SQL 'alerts' table.
+    """
+    if not product_data:
+        return False
+        
+    url, key = get_supabase_config()
+    headers = {
+        'apikey': key,
+        'Authorization': f'Bearer {key}',
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal'
+    }
+    
+    endpoint = f"{url}/rest/v1/alerts"
+    
+    payload = {
+        "country_code": country_code,
+        "category_name": category_name,
+        "product_data": product_data
+    }
+    
+    try:
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        
+        if response.status_code in [200, 201, 204]:
+            if debug: print(f"✅ Alert stored: {product_data.get('title', 'Product')[:30]}...")
+            return True
+        else:
+            if debug: 
+                print(f"❌ Alert storage failed: HTTP {response.status_code}")
+                print(f"   Response: {response.text}")
+            return False
+            
+    except Exception as e:
+        if debug: print(f"❌ Alert storage error: {e}")
+        return False
+
+
 if __name__ == "__main__":
     print("Supabase Utils Loaded (Direct HTTP API Version)")
     
