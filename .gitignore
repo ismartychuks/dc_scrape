@@ -1,6 +1,7 @@
 __pycache__/
 *.pkl
 *.json
+!hollowscan_app/**/*.json
 *.log
 venv/
 .env
