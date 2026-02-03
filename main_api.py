@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 main_api.py
-Professional FastAPI backend for SmartyMetrics Mobile App.
+Professional FastAPI backend for hollowScan Mobile App.
 Provides endpoints for feed, categories, and subscription management.
 """
  
@@ -22,7 +22,7 @@ from supabase_utils import get_supabase_config, sanitize_text
 # Load environment variables first
 load_dotenv()
 
-app = FastAPI(title="SmartyMetrics Mobile API", version="1.0.0")
+app = FastAPI(title="hollowScan Mobile API", version="1.0.0")
 
 # Enable CORS for mobile development
 app.add_middleware(
@@ -252,7 +252,7 @@ def get_user_from_db(user_id: str):
 
 @app.get("/")
 async def root():
-    return {"status": "online", "app": "SmartyMetrics API", "v": "1.0.0"}
+    return {"status": "online", "app": "hollowScan API", "v": "1.0.0"}
 
 @app.get("/v1/categories")
 async def get_categories():
